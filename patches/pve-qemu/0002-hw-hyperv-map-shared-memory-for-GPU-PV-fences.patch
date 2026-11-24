@@ -1,0 +1,51 @@
+[PATCH 02/43] hw/hyperv: map shared memory for GPU-PV fences
+
+diff --git a/hw/hyperv/gpupv.c b/hw/hyperv/gpupv.c
+index 9a8aed5..f5531b8 100644
+--- a/hw/hyperv/gpupv.c
++++ b/hw/hyperv/gpupv.c
+@@ -30,6 +30,8 @@
+ #include "hw/core/qdev-properties-system.h"
+ #include "hw/hyperv/vmbus.h"
+ #include "hw/pci/pci_device.h"
++#include "system/address-spaces.h"
++#include "system/hostmem.h"
+ #include "qom/object.h"
+ 
+ #define GPUPV_GLOBAL_GUID   "dde9cbc0-5060-4436-9448-ea1254a5d177"
+@@ -71,6 +73,10 @@ struct GpupvChannel {
+     CharFrontend chr;
+     GByteArray *rx;
+     GQueue out;
++
++    /* Memory shared with the backend, for fences. Only the global channel has it. */
++    HostMemoryBackend *iomem;
++    uint64_t iomem_base;
+ };
+ 
+ static void gpupv_send_frame(GpupvChannel *s, uint16_t type, uint16_t flags,
+@@ -241,6 +247,12 @@ static void gpupv_vmdev_realize(VMBusDevice *vdev, Error **errp)
+     g_queue_init(&s->out);
+     qemu_chr_fe_set_handlers(&s->chr, gpupv_chr_can_read, gpupv_chr_read,
+                              NULL, NULL, s, NULL, true);
++    if (s->iomem) {
++        MemoryRegion *mr = host_memory_backend_get_memory(s->iomem);
++
++        host_memory_backend_set_mapped(s->iomem, true);
++        memory_region_add_subregion_overlap(get_system_memory(), s->iomem_base, mr, 1);
++    }
+ }
+ 
+ static void gpupv_vmdev_unrealize(VMBusDevice *vdev)
+@@ -262,6 +274,8 @@ static void gpupv_vmdev_reset(VMBusDevice *vdev)
+ 
+ static const Property gpupv_channel_props[] = {
+     DEFINE_PROP_CHR("chardev", GpupvChannel, chr),
++    DEFINE_PROP_LINK("iomem", GpupvChannel, iomem, TYPE_MEMORY_BACKEND, HostMemoryBackend *),
++    DEFINE_PROP_UINT64("iomem-base", GpupvChannel, iomem_base, 0),
+ };
+ 
+ static void gpupv_channel_class_init(ObjectClass *klass, const void *data)
+-- 
+2.47.3
+

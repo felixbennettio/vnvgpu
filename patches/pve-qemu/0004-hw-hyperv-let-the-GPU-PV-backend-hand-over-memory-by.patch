@@ -1,0 +1,132 @@
+[PATCH 04/43] hw/hyperv: let the GPU-PV backend hand over memory by file descriptor
+
+diff --git a/hw/hyperv/gpupv.c b/hw/hyperv/gpupv.c
+index f5531b8..f0b0f3a 100644
+--- a/hw/hyperv/gpupv.c
++++ b/hw/hyperv/gpupv.c
+@@ -16,6 +16,13 @@
+  * For a GPA-direct packet the payload starts with a uint32 range count and
+  * that many {uint64 base, uint64 len} pairs, then the message.
+  *
++ * GPUPV_EVT_ARENA, from the backend only, carries {uint64 base, uint64 size} and
++ * a file descriptor. Mapping that file gives memory the guest then sees at base,
++ * over the shared window. Video memory through BAR1 comes this way, as only
++ * the file the backend set up can be mapped. It is a RAM device region, like a
++ * VFIO BAR: KVM maps it straight to the guest, and QEMU's own accesses are exact.
++ * A memory type does not come with it on AMD, where the guest's PAT decides.
++ *
+  * This work is licensed under the terms of the GNU GPL, version 2 or later.
+  * See the COPYING file in the top-level directory.
+  */
+@@ -47,6 +54,7 @@
+ #define GPUPV_EVT_OPEN      0xf001
+ #define GPUPV_EVT_CLOSE     0xf002
+ #define GPUPV_EVT_RESET     0xf003
++#define GPUPV_EVT_ARENA     0xf010
+ 
+ #define GPUPV_MAX_FRAME     (4 * 1024 * 1024)
+ 
+@@ -77,6 +85,12 @@ struct GpupvChannel {
+     /* Memory shared with the backend, for fences. Only the global channel has it. */
+     HostMemoryBackend *iomem;
+     uint64_t iomem_base;
++
++    /* Memory the backend hands over later, see GPUPV_EVT_ARENA. */
++    MemoryRegion arena;
++    void *arena_ptr;
++    uint64_t arena_size;
++    int arena_fd;
+ };
+ 
+ static void gpupv_send_frame(GpupvChannel *s, uint16_t type, uint16_t flags,
+@@ -169,6 +183,42 @@ static void gpupv_chan_notify(VMBusChannel *chan)
+     vmbus_channel_recv_done(chan);
+ }
+ 
++static void gpupv_drop_arena(GpupvChannel *s)
++{
++    if (s->arena_ptr) {
++        memory_region_del_subregion(get_system_memory(), &s->arena);
++        object_unparent(OBJECT(&s->arena));
++        munmap(s->arena_ptr, s->arena_size);
++        s->arena_ptr = NULL;
++    }
++}
++
++static void gpupv_map_arena(GpupvChannel *s, const uint8_t *data, uint32_t len)
++{
++    uint64_t base, size;
++    void *ptr;
++
++    if (s->arena_fd < 0 || len != 16) {
++        error_report("gpupv: arena frame with no file or the wrong size");
++        return;
++    }
++    base = ldq_le_p(data);
++    size = ldq_le_p(data + 8);
++    gpupv_drop_arena(s);
++    ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, s->arena_fd, 0);
++    close(s->arena_fd);
++    s->arena_fd = -1;
++    if (ptr == MAP_FAILED) {
++        error_report("gpupv: arena of 0x%" PRIx64 " bytes: %s", size, strerror(errno));
++        return;
++    }
++    s->arena_ptr = ptr;
++    s->arena_size = size;
++    memory_region_init_ram_device_ptr(&s->arena, OBJECT(s), "gpupv-arena", size, ptr);
++    memory_region_add_subregion_overlap(get_system_memory(), base, &s->arena, 2);
++    info_report("gpupv: arena of 0x%" PRIx64 " bytes at 0x%" PRIx64, size, base);
++}
++
+ static int gpupv_chr_can_read(void *opaque)
+ {
+     return 64 * 1024;
+@@ -177,7 +227,15 @@ static int gpupv_chr_can_read(void *opaque)
+ static void gpupv_chr_read(void *opaque, const uint8_t *buf, int size)
+ {
+     GpupvChannel *s = opaque;
++    int fd = qemu_chr_fe_get_msgfd(&s->chr);
+ 
++    /* The socket keeps a passed file only until its next read, so take it now. */
++    if (fd >= 0) {
++        if (s->arena_fd >= 0) {
++            close(s->arena_fd);
++        }
++        s->arena_fd = fd;
++    }
+     g_byte_array_append(s->rx, buf, size);
+ 
+     while (s->rx->len >= sizeof(GpupvFrame)) {
+@@ -196,6 +254,12 @@ static void gpupv_chr_read(void *opaque, const uint8_t *buf, int size)
+             break;
+         }
+ 
++        if (le16_to_cpu(f.type) == GPUPV_EVT_ARENA) {
++            gpupv_map_arena(s, s->rx->data + sizeof(f), len);
++            g_byte_array_remove_range(s->rx, 0, sizeof(f) + len);
++            continue;
++        }
++
+         o = g_malloc(sizeof(*o) + len);
+         o->type = le16_to_cpu(f.type);
+         o->need_comp = le16_to_cpu(f.flags) & GPUPV_FRAME_NEED_COMP;
+@@ -244,6 +308,7 @@ static void gpupv_vmdev_realize(VMBusDevice *vdev, Error **errp)
+         return;
+     }
+     s->rx = g_byte_array_new();
++    s->arena_fd = -1;
+     g_queue_init(&s->out);
+     qemu_chr_fe_set_handlers(&s->chr, gpupv_chr_can_read, gpupv_chr_read,
+                              NULL, NULL, s, NULL, true);
+@@ -260,6 +325,7 @@ static void gpupv_vmdev_unrealize(VMBusDevice *vdev)
+     GpupvChannel *s = GPUPV_CHANNEL(vdev);
+ 
+     gpupv_drop_pending(s);
++    gpupv_drop_arena(s);
+     g_byte_array_free(s->rx, true);
+     qemu_chr_fe_deinit(&s->chr, false);
+ }
+-- 
+2.47.3
+

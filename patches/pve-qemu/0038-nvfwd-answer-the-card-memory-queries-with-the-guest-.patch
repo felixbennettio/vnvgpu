@@ -1,0 +1,197 @@
+[PATCH 38/43] nvfwd: answer the card memory queries with the guest VIDEO budget
+
+diff --git a/hw/misc/nvfwd/fbinfo.c b/hw/misc/nvfwd/fbinfo.c
+new file mode 100644
+index 0000000..a269c14
+--- /dev/null
++++ b/hw/misc/nvfwd/fbinfo.c
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include <string.h>
++#include "fbinfo.h"
++
++static uint32_t get32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
++static uint32_t min32(uint32_t a, uint64_t b) { return b < a ? (uint32_t)b : a; }
++
++unsigned fbinfo_budget_answer(FbInfoSeen *seen, uint8_t *params, size_t size, uint64_t limit,
++                              uint64_t charged)
++{
++    uint32_t count, i, total = 0, heap = 0;
++    bool have_total = false, have_heap = false;
++    uint64_t limit_kib = limit / 1024, charged_kib = (charged + 1023) / 1024;
++    uint64_t heap_new, free_cap;
++    unsigned changed = 0;
++
++    if (!params || size < 4) {
++        return 0;
++    }
++    count = get32(params);
++    if (count > FB_INFO_MAX_LIST || size < 4 + (size_t)count * 8) {
++        return 0;
++    }
++    /* The driver's sizes in this answer, remembered for answers that lack them. */
++    for (i = 0; i < count; i++) {
++        uint32_t index = get32(params + 4 + i * 8), data = get32(params + 8 + i * 8);
++        if (index == FB_INFO_TOTAL_RAM_SIZE) {
++            total = data, have_total = true;
++        } else if (index == FB_INFO_HEAP_SIZE) {
++            heap = data, have_heap = true;
++        }
++    }
++    if (have_total) {
++        seen->total_kib = total;
++    }
++    if (have_heap) {
++        seen->heap_kib = heap;
++    }
++    total = seen->total_kib;
++    heap = seen->heap_kib;
++    /* The budgeted heap: the budget less the host's reserve, where both sizes are known; else the
++     * budget itself (the reserve is unknown). Never above the driver's heap. */
++    if (total && heap && heap <= total) {
++        uint64_t reserve = total - heap;
++        heap_new = limit_kib > reserve ? limit_kib - reserve : 0;
++    } else {
++        heap_new = limit_kib;
++    }
++    if (heap && heap_new > heap) {
++        heap_new = heap;
++    }
++    free_cap = heap_new > charged_kib ? heap_new - charged_kib : 0;
++    for (i = 0; i < count; i++) {
++        uint8_t *e = params + 4 + i * 8;
++        uint32_t index = get32(e), data = get32(e + 4), now = data;
++        switch (index) {
++        case FB_INFO_RAM_SIZE:
++        case FB_INFO_TOTAL_RAM_SIZE:
++        case FB_INFO_USABLE_RAM_SIZE:
++            now = min32(data, limit_kib);
++            break;
++        case FB_INFO_HEAP_SIZE:
++        case FB_INFO_MAPPABLE_HEAP_SIZE:
++            now = min32(data, heap_new);
++            break;
++        case FB_INFO_HEAP_FREE:
++        case FB_INFO_LARGEST_FREE_REGION_SIZE_KB:
++            now = min32(data, free_cap);
++            break;
++        default:
++            break;
++        }
++        if (now != data) {
++            put32(e + 4, now);
++            changed++;
++        }
++    }
++    return changed;
++}
+diff --git a/hw/misc/nvfwd/fbinfo.h b/hw/misc/nvfwd/fbinfo.h
+new file mode 100644
+index 0000000..7005f96
+--- /dev/null
++++ b/hw/misc/nvfwd/fbinfo.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef NVFWD_FBINFO_H
++#define NVFWD_FBINFO_H
++#include <stddef.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++/*
++ * The guest's view of the card's memory under its VIDEO budget. The driver answers
++ * NV2080_CTRL_CMD_FB_GET_INFO_V2 with the whole card; nvidia-smi reads TOTAL_RAM_SIZE, HEAP_SIZE
++ * and HEAP_FREE from it, and CUDA's cuMemGetInfo HEAP_SIZE and HEAP_FREE (all in KiB). An answered
++ * list is rewritten so the guest sees its budget as the card: the memory sizes are capped at the
++ * budget, the heap keeps the host's reserve (TOTAL_RAM_SIZE - HEAP_SIZE) below it, and the free
++ * heap is what the budget leaves after this guest's charged bytes, and never more than the card
++ * has free. Nothing is raised above what the driver said.
++ */
++#define FB_GET_INFO_V2 0x20801303u
++#define FB_INFO_MAX_LIST 128u
++#define FB_INFO_RAM_SIZE 0x07u
++#define FB_INFO_TOTAL_RAM_SIZE 0x08u
++#define FB_INFO_HEAP_SIZE 0x09u
++#define FB_INFO_MAPPABLE_HEAP_SIZE 0x0au
++#define FB_INFO_LARGEST_FREE_REGION_SIZE_KB 0x12u
++#define FB_INFO_HEAP_FREE 0x16u
++#define FB_INFO_USABLE_RAM_SIZE 0x20u
++
++typedef struct FbInfoSeen {
++    /* The driver's own TOTAL_RAM_SIZE and HEAP_SIZE, once an answer has carried them (constant
++     * for the card); 0 until then. */
++    uint32_t total_kib, heap_kib;
++} FbInfoSeen;
++
++/*
++ * Rewrite answered V2 params `params` (`size` bytes) for budget `limit` and charged `charged`
++ * bytes. A list that does not fit `size` or claims more than FB_INFO_MAX_LIST entries is left
++ * alone. Returns the number of entries changed.
++ */
++unsigned fbinfo_budget_answer(FbInfoSeen *seen, uint8_t *params, size_t size, uint64_t limit,
++                              uint64_t charged);
++#endif
+diff --git a/hw/misc/nvfwd/forward.c b/hw/misc/nvfwd/forward.c
+index 0874de7..ae3f6d3 100644
+--- a/hw/misc/nvfwd/forward.c
++++ b/hw/misc/nvfwd/forward.c
+@@ -505,6 +505,23 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+             undo_runs(&account); /* the object that would have owned these pages does not exist */
+         }
+     }
++    if (!uvm && nr == ESC_RM_CONTROL && r->ret == 0 && size >= RM_CONTROL_STATUS + 4) {
++        uint32_t cmd, status, params_size;
++        uint64_t params;
++
++        memcpy(&cmd, arg + RM_CONTROL_CMD, 4);
++        memcpy(&status, arg + RM_CONTROL_STATUS, 4);
++        memcpy(&params, arg + RM_CONTROL_PARAMS, 8);
++        memcpy(&params_size, arg + RM_CONTROL_PARAMS_SIZE, 4);
++        /* The cards memory as the guests budget makes it (fbinfo.h); the pointer is ours. */
++        if (cmd == FB_GET_INFO_V2 && status == 0 && params) {
++            qemu_mutex_lock(&s->lock);
++            fbinfo_budget_answer(&s->fbinfo, (uint8_t *)(uintptr_t)params, params_size,
++                                 objects_limit(s->objects, MEMORY_VIDEO),
++                                 objects_bytes(s->objects, MEMORY_VIDEO));
++            qemu_mutex_unlock(&s->lock);
++        }
++    }
+     if (!uvm && nr == ESC_RM_CONTROL) {
+         timeslice_guest_after(&s->timeslice, arg, size, r->ret, host_timeslice_apply, s);
+         interleave_guest_after(&s->timeslice, arg, size, r->ret, host_interleave_apply, s);
+diff --git a/hw/misc/nvfwd/meson.build b/hw/misc/nvfwd/meson.build
+index 40732be..1940030 100644
+--- a/hw/misc/nvfwd/meson.build
++++ b/hw/misc/nvfwd/meson.build
+@@ -3,6 +3,7 @@ nvfwd_ss = files(
+   'callrate.c',
+   'objects.c',
+   'timeslice.c',
++  'fbinfo.c',
+   'interleave.c',
+   'host_timeslice.c',
+   'maps.c',
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index 8ed3bf5..0c73bdb 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -9,6 +9,7 @@
+ #ifndef HW_MISC_NVFWD_H
+ #define HW_MISC_NVFWD_H
+ 
++#include "fbinfo.h"
+ #include "qemu/thread.h"
+ #include "hw/pci/pci_device.h"
+ #include "qom/object.h"
+@@ -87,6 +88,7 @@ struct NvfwdState {
+     uint32_t seen_count;
+     Sensors *sensors;
+     Objects *objects;
++    FbInfoSeen fbinfo; /* under lock */
+     Maps *maps;
+     CallRate rate;
+     uint32_t max_call_rate, max_call_burst, max_objects, max_maps;
+-- 
+2.47.3
+

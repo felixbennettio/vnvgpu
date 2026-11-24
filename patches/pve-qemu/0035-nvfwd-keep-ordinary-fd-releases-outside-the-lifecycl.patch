@@ -1,0 +1,43 @@
+[PATCH 35/43] nvfwd: keep ordinary fd releases outside the lifecycle gate
+
+diff --git a/hw/misc/nvfwd/fds.c b/hw/misc/nvfwd/fds.c
+index 776e3c1..49edbdb 100644
+--- a/hw/misc/nvfwd/fds.c
++++ b/hw/misc/nvfwd/fds.c
+@@ -33,6 +33,7 @@ void fd_release_locked(NvfwdState *s, uint32_t id)
+     int closing = -1;
+ 
+     qemu_mutex_lock(&s->lock);
++    g_assert(s->fd_holds[id] > 0);
+     if (!--s->fd_holds[id]) {
+         closing = s->fd_closing[id];
+         s->fd_closing[id] = -1;
+@@ -45,7 +46,25 @@ void fd_release_locked(NvfwdState *s, uint32_t id)
+ 
+ void fd_release(NvfwdState *s, uint32_t id)
+ {
++    bool deferred;
++
++    /* Ordinary ioctl/mmap completion must not wait behind a host control.
++     * Keep the last deferred-close hold until lifecycle is acquired: otherwise
++     * do_open could reuse the slot before the old fd is actually closed. */
++    qemu_mutex_lock(&s->lock);
++    g_assert(s->fd_holds[id] > 0);
++    deferred = s->fd_holds[id] == 1 && s->fd_closing[id] >= 0;
++    if (!deferred) {
++        s->fd_holds[id]--;
++    }
++    qemu_mutex_unlock(&s->lock);
++    if (!deferred) {
++        return;
++    }
++
+     timeslice_enter(&s->timeslice);
++    /* Reacquires s->lock and rechecks both the hold count and current pending
++     * close fd. No fd captured before dropping s->lock is used for close. */
+     fd_release_locked(s, id);
+     timeslice_leave(&s->timeslice);
+ }
+-- 
+2.47.3
+

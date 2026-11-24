@@ -1,0 +1,81 @@
+[PATCH 34/43] nvfwd: bound timeslice status while retaining complete outcome counts
+
+diff --git a/hw/misc/nvfwd/fds.c b/hw/misc/nvfwd/fds.c
+index 0a499e3..776e3c1 100644
+--- a/hw/misc/nvfwd/fds.c
++++ b/hw/misc/nvfwd/fds.c
+@@ -76,8 +76,9 @@ void fd_close(NvfwdState *s, uint32_t id)
+ 
+ /*
+  * Calls past the rate wait here, on the vCPU that made them. That costs the guest time and nothing
+- * else: no lock is held, and the host's driver gets a rest. A failure would crash a program for
+- * being busy.
++ * else: no table lock is held, and the host's driver gets a rest. Lifecycle-gated
++ * calls still serialize behind that gate while throttled, even with policy off.
++ * A failure would crash a program for being busy.
+  */
+ void throttle(NvfwdState *s)
+ {
+diff --git a/hw/misc/nvfwd/timeslice.c b/hw/misc/nvfwd/timeslice.c
+index ed3fec2..fb7fa75 100644
+--- a/hw/misc/nvfwd/timeslice.c
++++ b/hw/misc/nvfwd/timeslice.c
+@@ -145,21 +145,46 @@ uint32_t timeslice_set(Timeslice *t, uint64_t us, TimesliceApply *apply, void *o
+ 
+ char *timeslice_report(Timeslice *t)
+ {
+-    uint32_t count;
++    enum { MAX_REPORTED_REFS = 64, MAX_REPORT_BYTES = 16 * 1024 };
++    uint32_t count, reported = 0, applied = 0, failed = 0, pending = 0;
+     ObjectInfo *refs;
+-    GString *s = g_string_new(NULL);
++    GString *rows = g_string_new(NULL), *s;
+     timeslice_enter(t);
+     refs = objects_tsg_refs(t->objects, &count);
+-    g_string_append_printf(s, "version=1 requested_us=%" G_GUINT64_FORMAT
+-                           " scope=requested-not-hardware references=%u\n", t->desired_us, count);
+     for (uint32_t i = 0; i < count; i++) {
+         ObjectInfo *r = &refs[i];
+-        g_string_append_printf(s, "client=%#x object=%#x generation=%" G_GUINT64_FORMAT
+-            " owned=%u attempted=%u requested_us=%" G_GUINT64_FORMAT
+-            " errno=%d rm_status=%#x\n", r->client, r->object, r->generation,
+-            r->tsg_owned, r->timeslice_attempted, r->timeslice_us,
+-            r->timeslice_errno, r->timeslice_status);
++        if (t->desired_us) {
++            if (!r->tsg_owned || r->timeslice_errno || r->timeslice_status) {
++                failed++;
++            } else if (!r->timeslice_attempted || r->timeslice_us != t->desired_us) {
++                pending++;
++            } else {
++                applied++;
++            }
++        }
++        if (reported < MAX_REPORTED_REFS) {
++            char *row = g_strdup_printf("client=%#x object=%#x generation=%" G_GUINT64_FORMAT
++                " owned=%u attempted=%u requested_us=%" G_GUINT64_FORMAT
++                " errno=%d rm_status=%#x\n", r->client, r->object, r->generation,
++                r->tsg_owned, r->timeslice_attempted, r->timeslice_us,
++                r->timeslice_errno, r->timeslice_status);
++            /* Reserve 512 bytes for the bounded numeric summary below. QMP
++             * escaping only expands our newline; total remains below 17 KiB. */
++            if (rows->len + strlen(row) <= MAX_REPORT_BYTES - 512) {
++                g_string_append(rows, row);
++                reported++;
++            }
++            g_free(row);
++        }
+     }
++    s = g_string_new(NULL);
++    g_string_append_printf(s, "version=1 requested_us=%" G_GUINT64_FORMAT
++        " scope=requested-not-hardware references=%u reported=%u truncated=%u"
++        " applied=%u failed=%u pending=%u\n",
++        t->desired_us, count, reported, reported < count, applied, failed, pending);
++    g_string_append_len(s, rows->str, rows->len);
++    g_assert(s->len <= MAX_REPORT_BYTES);
++    g_string_free(rows, TRUE);
+     g_free(refs);
+     timeslice_leave(t);
+     return g_string_free(s, FALSE);
+-- 
+2.47.3
+

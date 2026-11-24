@@ -1,0 +1,27 @@
+[PATCH 32/43] nvfwd: reject negative runtime budget values
+
+diff --git a/hw/misc/nvfwd/nvfwd.c b/hw/misc/nvfwd/nvfwd.c
+index 7d909cf..e9b13c1 100644
+--- a/hw/misc/nvfwd/nvfwd.c
++++ b/hw/misc/nvfwd/nvfwd.c
+@@ -243,10 +243,15 @@ static void nvfwd_set_vram_budget(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+ {
+     NvfwdState *s = NVFWD(obj);
+-    uint64_t bytes;
++    int64_t bytes;
+ 
+     if (!nvfwd_budget_ready(obj, errp) ||
+-        !visit_type_uint64(v, name, &bytes, errp)) {
++        !visit_type_int64(v, name, &bytes, errp)) {
++        return;
++    }
++    /* QEMU's uint64 visitor also accepts negative integers as bit patterns. */
++    if (bytes < 0) {
++        error_setg(errp, "nvfwd VRAM budget must be between 0 and INT64_MAX bytes");
+         return;
+     }
+     qemu_mutex_lock(&s->lock);
+-- 
+2.47.3
+

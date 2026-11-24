@@ -1,0 +1,77 @@
+[PATCH 40/43] gpupv: rescind both channels on backend loss, in reverse offer order
+
+diff --git a/hw/hyperv/gpupv.c b/hw/hyperv/gpupv.c
+index 3f5a106..17467d2 100644
+--- a/hw/hyperv/gpupv.c
++++ b/hw/hyperv/gpupv.c
+@@ -95,6 +95,10 @@ struct GpupvChannel {
+     /*
+      * The backend went away. Nothing sent to it arrives, so the channel is
+      * withdrawn from the guest (rescind-on-loss) until a backend connects again.
++     * Both channels go: Windows tears the adapter down with synchronous
++     * requests on the global channel too, and one left open to a dead backend
++     * waits forever, and every process start with it (measured: the vGPU
++     * channel alone hangs the guest).
+      */
+     bool backend_lost;
+     bool write_failed;
+@@ -407,7 +411,7 @@ static const Property gpupv_channel_props[] = {
+     DEFINE_PROP_CHR("chardev", GpupvChannel, chr),
+     DEFINE_PROP_LINK("iomem", GpupvChannel, iomem, TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+     DEFINE_PROP_UINT64("iomem-base", GpupvChannel, iomem_base, 0),
+-    DEFINE_PROP_BOOL("rescind-on-loss", GpupvChannel, rescind_on_loss, false),
++    DEFINE_PROP_BOOL("rescind-on-loss", GpupvChannel, rescind_on_loss, true),
+ };
+ 
+ static void gpupv_channel_class_init(ObjectClass *klass, const void *data)
+@@ -439,16 +443,6 @@ static void gpupv_global_class_init(ObjectClass *klass, const void *data)
+     vdc->mmio_size_mb = GPUPV_IOSPACE_MB;
+ }
+ 
+-/*
+- * Losing the vGPU channel means "this adapter is gone", which Windows turns
+- * into device-removed for its applications. The global channel stays by
+- * default: taking it back tears down the whole provider.
+- */
+-static void gpupv_vgpu_instance_init(Object *obj)
+-{
+-    GPUPV_CHANNEL(obj)->rescind_on_loss = true;
+-}
+-
+ static void gpupv_vgpu_class_init(ObjectClass *klass, const void *data)
+ {
+     VMBusDeviceClass *vdc = VMBUS_DEVICE_CLASS(klass);
+@@ -577,7 +571,6 @@ static const TypeInfo gpupv_types[] = {
+         .name          = "gpupv-vgpu",
+         .parent        = TYPE_GPUPV_CHANNEL,
+         .class_init    = gpupv_vgpu_class_init,
+-        .instance_init = gpupv_vgpu_instance_init,
+     },
+     {
+         .name          = TYPE_GPUPV_RENDER,
+diff --git a/hw/hyperv/vmbus.c b/hw/hyperv/vmbus.c
+index 85fc83b..a5a4c92 100644
+--- a/hw/hyperv/vmbus.c
++++ b/hw/hyperv/vmbus.c
+@@ -2278,13 +2278,17 @@ static void vmbus_listen(VMBus *vmbus)
+     VMBusChannel *chan;
+ 
+     if (vmbus_initialized(vmbus)) {
+-        QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
++        /* Withdrawn in the reverse of the offer order: a device's later
++         * channels, and later devices, go before what they were offered after. */
++        QTAILQ_FOREACH_REVERSE(chan, &vmbus->channel_list, link) {
+             if (chan->rescind_state == VMRESCIND_PENDING) {
+                 chan->rescind_state = VMRESCIND_SENDING;
+                 vmbus->state = VMBUS_RESCIND;
+                 vmbus_resched(vmbus);
+                 return;
+             }
++        }
++        QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
+             if (chan->rescind_state == VMRESCIND_REOFFER) {
+                 chan->rescind_state = VMRESCIND_REOFFERING;
+                 vmbus->state = VMBUS_REOFFER;
+-- 
+2.47.3
+

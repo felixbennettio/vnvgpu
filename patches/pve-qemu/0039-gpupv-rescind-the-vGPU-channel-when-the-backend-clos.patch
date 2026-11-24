@@ -1,0 +1,518 @@
+[PATCH 39/43] gpupv: rescind the vGPU channel when the backend closes; vmbus: rescind, relid release and re-offer of one channel
+
+diff --git a/hw/hyperv/gpupv.c b/hw/hyperv/gpupv.c
+index 28a31f0..3f5a106 100644
+--- a/hw/hyperv/gpupv.c
++++ b/hw/hyperv/gpupv.c
+@@ -91,6 +91,14 @@ struct GpupvChannel {
+     void *arena_ptr;
+     uint64_t arena_size;
+     int arena_fd;
++
++    /*
++     * The backend went away. Nothing sent to it arrives, so the channel is
++     * withdrawn from the guest (rescind-on-loss) until a backend connects again.
++     */
++    bool backend_lost;
++    bool write_failed;
++    bool rescind_on_loss;
+ };
+ 
+ static void gpupv_send_frame(GpupvChannel *s, uint16_t type, uint16_t flags,
+@@ -104,15 +112,17 @@ static void gpupv_send_frame(GpupvChannel *s, uint16_t type, uint16_t flags,
+         .tid = cpu_to_le64(tid),
+     };
+ 
+-    if (!qemu_chr_fe_backend_connected(&s->chr)) {
++    if (s->backend_lost || !qemu_chr_fe_backend_open(&s->chr)) {
+         return;
+     }
+-    qemu_chr_fe_write_all(&s->chr, (uint8_t *)&f, sizeof(f));
+-    if (alen) {
+-        qemu_chr_fe_write_all(&s->chr, a, alen);
+-    }
+-    if (blen) {
+-        qemu_chr_fe_write_all(&s->chr, b, blen);
++    if (qemu_chr_fe_write_all(&s->chr, (uint8_t *)&f, sizeof(f)) != sizeof(f) ||
++        (alen && qemu_chr_fe_write_all(&s->chr, a, alen) != alen) ||
++        (blen && qemu_chr_fe_write_all(&s->chr, b, blen) != blen)) {
++        if (!s->write_failed) {
++            warn_report("%s: writing to the backend failed",
++                        object_get_typename(OBJECT(s)));
++            s->write_failed = true;
++        }
+     }
+ }
+ 
+@@ -187,6 +197,7 @@ static void gpupv_chan_notify(VMBusChannel *chan)
+             return;
+         }
+         while ((req = vmbus_channel_recv_peek(chan, sizeof(*req)))) {
++            /* With no backend the packet has nowhere to go; it is dropped. */
+             gpupv_forward(s, req);
+             vmbus_free_req(req);
+             vmbus_channel_recv_pop(chan);
+@@ -312,6 +323,47 @@ static void gpupv_close_channel(VMBusChannel *chan)
+     gpupv_send_frame(s, GPUPV_EVT_CLOSE, 0, 0, NULL, 0, NULL, 0);
+ }
+ 
++static void gpupv_chr_event(void *opaque, QEMUChrEvent event)
++{
++    GpupvChannel *s = opaque;
++    VMBusChannel *chan = vmbus_device_channel(VMBUS_DEVICE(s), 0);
++    const char *name = object_get_typename(OBJECT(s));
++
++    switch (event) {
++    case CHR_EVENT_CLOSED:
++        if (s->backend_lost) {
++            return;
++        }
++        s->backend_lost = true;
++        gpupv_drop_pending(s);
++        g_byte_array_set_size(s->rx, 0);
++        if (s->arena_fd >= 0) {
++            close(s->arena_fd);
++            s->arena_fd = -1;
++        }
++        warn_report("%s: backend closed%s", name,
++                    s->rescind_on_loss ? ", rescinding the channel" : "");
++        if (s->rescind_on_loss && chan) {
++            vmbus_channel_rescind(chan);
++        }
++        break;
++    case CHR_EVENT_OPENED:
++        /* The first connection is opened before the guest is offered anything. */
++        if (!s->backend_lost) {
++            return;
++        }
++        s->backend_lost = false;
++        s->write_failed = false;
++        info_report("%s: backend connected again", name);
++        if (s->rescind_on_loss && chan) {
++            vmbus_channel_reoffer(chan);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
+ static void gpupv_vmdev_realize(VMBusDevice *vdev, Error **errp)
+ {
+     GpupvChannel *s = GPUPV_CHANNEL(vdev);
+@@ -324,7 +376,7 @@ static void gpupv_vmdev_realize(VMBusDevice *vdev, Error **errp)
+     s->arena_fd = -1;
+     g_queue_init(&s->out);
+     qemu_chr_fe_set_handlers(&s->chr, gpupv_chr_can_read, gpupv_chr_read,
+-                             NULL, NULL, s, NULL, true);
++                             gpupv_chr_event, NULL, s, NULL, true);
+     if (s->iomem) {
+         MemoryRegion *mr = host_memory_backend_get_memory(s->iomem);
+ 
+@@ -355,6 +407,7 @@ static const Property gpupv_channel_props[] = {
+     DEFINE_PROP_CHR("chardev", GpupvChannel, chr),
+     DEFINE_PROP_LINK("iomem", GpupvChannel, iomem, TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+     DEFINE_PROP_UINT64("iomem-base", GpupvChannel, iomem_base, 0),
++    DEFINE_PROP_BOOL("rescind-on-loss", GpupvChannel, rescind_on_loss, false),
+ };
+ 
+ static void gpupv_channel_class_init(ObjectClass *klass, const void *data)
+@@ -386,6 +439,16 @@ static void gpupv_global_class_init(ObjectClass *klass, const void *data)
+     vdc->mmio_size_mb = GPUPV_IOSPACE_MB;
+ }
+ 
++/*
++ * Losing the vGPU channel means "this adapter is gone", which Windows turns
++ * into device-removed for its applications. The global channel stays by
++ * default: taking it back tears down the whole provider.
++ */
++static void gpupv_vgpu_instance_init(Object *obj)
++{
++    GPUPV_CHANNEL(obj)->rescind_on_loss = true;
++}
++
+ static void gpupv_vgpu_class_init(ObjectClass *klass, const void *data)
+ {
+     VMBusDeviceClass *vdc = VMBUS_DEVICE_CLASS(klass);
+@@ -511,9 +574,10 @@ static const TypeInfo gpupv_types[] = {
+         .class_init = gpupv_global_class_init,
+     },
+     {
+-        .name       = "gpupv-vgpu",
+-        .parent     = TYPE_GPUPV_CHANNEL,
+-        .class_init = gpupv_vgpu_class_init,
++        .name          = "gpupv-vgpu",
++        .parent        = TYPE_GPUPV_CHANNEL,
++        .class_init    = gpupv_vgpu_class_init,
++        .instance_init = gpupv_vgpu_instance_init,
+     },
+     {
+         .name          = TYPE_GPUPV_RENDER,
+diff --git a/hw/hyperv/trace-events b/hw/hyperv/trace-events
+index d8c96f1..0dea15c 100644
+--- a/hw/hyperv/trace-events
++++ b/hw/hyperv/trace-events
+@@ -16,6 +16,8 @@ vmbus_gpadl_torndown(uint32_t gpadl_id) "gpadl #%d"
+ vmbus_open_channel(uint32_t chan_id, uint32_t gpadl_id, uint32_t target_vp) "channel #%d gpadl #%d target vp %d"
+ vmbus_channel_open(uint32_t chan_id, uint32_t status) "channel #%d status %d"
+ vmbus_close_channel(uint32_t chan_id) "channel #%d"
++vmbus_rescind(uint32_t chan_id) "channel #%d"
++vmbus_relid_released(uint32_t chan_id) "channel #%d"
+ vmbus_handle_vmfd_change(void) ""
+ 
+ # hv-balloon
+diff --git a/hw/hyperv/vmbus.c b/hw/hyperv/vmbus.c
+index 9f16891..85fc83b 100644
+--- a/hw/hyperv/vmbus.c
++++ b/hw/hyperv/vmbus.c
+@@ -136,6 +136,21 @@ enum {
+     VMCHAN_OPEN,
+ };
+ 
++/*
++ * Withdrawing an offered channel, for a device whose backend has gone away.
++ * The guest answers a rescind with RELID_RELEASED once it has dropped the
++ * channel; only then may the same relid be offered again.
++ */
++enum {
++    VMRESCIND_NONE,
++    VMRESCIND_PENDING,      /* asked for, not yet posted */
++    VMRESCIND_SENDING,
++    VMRESCIND_SENT,         /* waiting for the guest to release the relid */
++    VMRESCIND_RELEASED,     /* guest let go; offer it again when asked */
++    VMRESCIND_REOFFER,      /* offer again, not yet posted */
++    VMRESCIND_REOFFERING,
++};
++
+ struct VMBusChannel {
+     VMBusDevice *dev;
+ 
+@@ -157,6 +172,9 @@ struct VMBusChannel {
+     uint8_t offer_state;
+     uint8_t state;
+     bool is_open;
++    uint8_t rescind_state;
++    /* offer again as soon as the guest releases the relid */
++    bool reoffer_wanted;
+ 
+     /* main device worker; copied from the device class */
+     VMBusChannelNotifyCb notify_cb;
+@@ -212,6 +230,8 @@ enum {
+     VMBUS_TEARDOWN_GPADL,
+     VMBUS_OPEN_CHANNEL,
+     VMBUS_UNLOAD,
++    VMBUS_RESCIND,
++    VMBUS_REOFFER,
+     VMBUS_STATE_MAX
+ };
+ 
+@@ -1641,6 +1661,8 @@ static void vmbus_deinit(VMBus *vmbus)
+ 
+     QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
+         chan->offer_state = VMOFFER_INIT;
++        chan->rescind_state = VMRESCIND_NONE;
++        chan->reoffer_wanted = false;
+     }
+ 
+     hyperv_sint_route_unref(vmbus->sint_route);
+@@ -1715,6 +1737,31 @@ static void handle_request_offers(VMBus *vmbus, void *msgdata, uint32_t msglen)
+     vmbus->state = VMBUS_OFFER;
+ }
+ 
++static void post_offer(VMBus *vmbus, VMBusChannel *chan)
++{
++    VMBusDeviceClass *vdc = VMBUS_DEVICE_GET_CLASS(chan->dev);
++    /* Hyper-V wants LE GUIDs */
++    QemuUUID classid = qemu_uuid_bswap(vdc->classid);
++    QemuUUID instanceid = qemu_uuid_bswap(chan->dev->instanceid);
++    struct vmbus_message_offer_channel msg = {
++        .header.message_type = VMBUS_MSG_OFFERCHANNEL,
++        .child_relid = chan->id,
++        .connection_id = chan_connection_id(chan),
++        .channel_flags = vdc->channel_flags,
++        .mmio_size_mb = vdc->mmio_size_mb,
++        .sub_channel_index = vmbus_channel_idx(chan),
++        .interrupt_flags = VMBUS_OFFER_INTERRUPT_DEDICATED,
++    };
++
++    memcpy(msg.type_uuid, &classid, sizeof(classid));
++    memcpy(msg.instance_uuid, &instanceid, sizeof(instanceid));
++    memcpy(msg.user_data, &vdc->pipe_mode, sizeof(vdc->pipe_mode));
++
++    trace_vmbus_send_offer(chan->id, chan->dev);
++
++    post_msg(vmbus, &msg, sizeof(msg));
++}
++
+ static void send_offer(VMBus *vmbus)
+ {
+     VMBusChannel *chan;
+@@ -1724,27 +1771,7 @@ static void send_offer(VMBus *vmbus)
+ 
+     QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
+         if (chan->offer_state == VMOFFER_SENDING) {
+-            VMBusDeviceClass *vdc = VMBUS_DEVICE_GET_CLASS(chan->dev);
+-            /* Hyper-V wants LE GUIDs */
+-            QemuUUID classid = qemu_uuid_bswap(vdc->classid);
+-            QemuUUID instanceid = qemu_uuid_bswap(chan->dev->instanceid);
+-            struct vmbus_message_offer_channel msg = {
+-                .header.message_type = VMBUS_MSG_OFFERCHANNEL,
+-                .child_relid = chan->id,
+-                .connection_id = chan_connection_id(chan),
+-                .channel_flags = vdc->channel_flags,
+-                .mmio_size_mb = vdc->mmio_size_mb,
+-                .sub_channel_index = vmbus_channel_idx(chan),
+-                .interrupt_flags = VMBUS_OFFER_INTERRUPT_DEDICATED,
+-            };
+-
+-            memcpy(msg.type_uuid, &classid, sizeof(classid));
+-            memcpy(msg.instance_uuid, &instanceid, sizeof(instanceid));
+-            memcpy(msg.user_data, &vdc->pipe_mode, sizeof(vdc->pipe_mode));
+-
+-            trace_vmbus_send_offer(chan->id, chan->dev);
+-
+-            post_msg(vmbus, &msg, sizeof(msg));
++            post_offer(vmbus, chan);
+             return;
+         }
+     }
+@@ -2087,6 +2114,189 @@ static bool complete_unload(VMBus *vmbus)
+     return true;
+ }
+ 
++static void process_message(VMBus *vmbus);
++
++void vmbus_channel_rescind(VMBusChannel *chan)
++{
++    /* Only a channel the guest was told about can be taken back. */
++    if (chan->offer_state != VMOFFER_SENT) {
++        return;
++    }
++    switch (chan->rescind_state) {
++    case VMRESCIND_NONE:
++        chan->rescind_state = VMRESCIND_PENDING;
++        break;
++    case VMRESCIND_REOFFER:
++        /* never posted the new offer: the guest still has nothing */
++        chan->rescind_state = VMRESCIND_RELEASED;
++        break;
++    default:
++        break;
++    }
++    chan->reoffer_wanted = false;
++    vmbus_resched(chan->vmbus);
++}
++
++void vmbus_channel_reoffer(VMBusChannel *chan)
++{
++    switch (chan->rescind_state) {
++    case VMRESCIND_PENDING:
++        /* back before the guest heard anything */
++        chan->rescind_state = VMRESCIND_NONE;
++        break;
++    case VMRESCIND_SENDING:
++    case VMRESCIND_SENT:
++        chan->reoffer_wanted = true;
++        break;
++    case VMRESCIND_RELEASED:
++        chan->rescind_state = VMRESCIND_REOFFER;
++        vmbus_resched(chan->vmbus);
++        break;
++    default:
++        break;
++    }
++}
++
++bool vmbus_channel_is_rescinded(VMBusChannel *chan)
++{
++    return chan->rescind_state != VMRESCIND_NONE;
++}
++
++static void send_rescind(VMBus *vmbus)
++{
++    VMBusChannel *chan;
++
++    QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
++        if (chan->rescind_state == VMRESCIND_SENDING) {
++            vmbus_message_rescind_channel_offer msg = {
++                .header.message_type = VMBUS_MSG_RESCIND_CHANNELOFFER,
++                .child_relid = chan->id,
++            };
++
++            trace_vmbus_rescind(chan->id);
++            post_msg(vmbus, &msg, sizeof(msg));
++            return;
++        }
++    }
++
++    g_assert_not_reached();
++}
++
++static bool complete_rescind(VMBus *vmbus)
++{
++    VMBusChannel *chan;
++
++    QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
++        if (chan->rescind_state == VMRESCIND_SENDING) {
++            chan->rescind_state = VMRESCIND_SENT;
++            info_report("vmbus: rescinded channel #%u", chan->id);
++            return true;
++        }
++    }
++
++    g_assert_not_reached();
++}
++
++static void send_reoffer(VMBus *vmbus)
++{
++    VMBusChannel *chan;
++
++    QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
++        if (chan->rescind_state == VMRESCIND_REOFFERING) {
++            post_offer(vmbus, chan);
++            return;
++        }
++    }
++
++    g_assert_not_reached();
++}
++
++static bool complete_reoffer(VMBus *vmbus)
++{
++    VMBusChannel *chan;
++
++    QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
++        if (chan->rescind_state == VMRESCIND_REOFFERING) {
++            chan->rescind_state = VMRESCIND_NONE;
++            info_report("vmbus: offered channel #%u again", chan->id);
++            return true;
++        }
++    }
++
++    g_assert_not_reached();
++}
++
++static void handle_relid_released(VMBus *vmbus,
++                                  vmbus_message_close_channel *msg,
++                                  uint32_t msglen)
++{
++    VMBusChannel *chan;
++    VMBusGpadl *gpadl, *tmp;
++
++    /* RELID_RELEASED has the same layout as CLOSECHANNEL: header, relid. */
++    if (msglen < sizeof(*msg) || !vmbus_initialized(vmbus)) {
++        return;
++    }
++
++    trace_vmbus_relid_released(msg->child_relid);
++
++    chan = find_channel(vmbus, msg->child_relid);
++    if (!chan || chan->rescind_state != VMRESCIND_SENT) {
++        error_report("vmbus: guest released relid %u that was not rescinded",
++                     msg->child_relid);
++        return;
++    }
++
++    close_channel(chan);
++    chan->state = VMCHAN_INIT;
++
++    /*
++     * A guest drops the ring buffer GPADLs of a rescinded channel without
++     * tearing them down, as the host is not expected to answer any more.
++     */
++    QTAILQ_FOREACH_SAFE(gpadl, &vmbus->gpadl_list, link, tmp) {
++        if (gpadl->child_relid == chan->id && gpadl->state == VMGPADL_ALIVE) {
++            gpadl->state = VMGPADL_TORNDOWN;
++            vmbus_put_gpadl(gpadl);
++        }
++    }
++
++    info_report("vmbus: guest released channel #%u", chan->id);
++    chan->rescind_state = chan->reoffer_wanted ? VMRESCIND_REOFFER
++                                               : VMRESCIND_RELEASED;
++    chan->reoffer_wanted = false;
++
++    vdev_reset_on_close(chan->dev);
++}
++
++/*
++ * Host-initiated work goes first: a rescind or a new offer is a message of
++ * our own, so it can only be posted from the state machine.
++ */
++static void vmbus_listen(VMBus *vmbus)
++{
++    VMBusChannel *chan;
++
++    if (vmbus_initialized(vmbus)) {
++        QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
++            if (chan->rescind_state == VMRESCIND_PENDING) {
++                chan->rescind_state = VMRESCIND_SENDING;
++                vmbus->state = VMBUS_RESCIND;
++                vmbus_resched(vmbus);
++                return;
++            }
++            if (chan->rescind_state == VMRESCIND_REOFFER) {
++                chan->rescind_state = VMRESCIND_REOFFERING;
++                vmbus->state = VMBUS_REOFFER;
++                vmbus_resched(vmbus);
++                return;
++            }
++        }
++    }
++
++    process_message(vmbus);
++}
++
+ static void process_message(VMBus *vmbus)
+ {
+     struct hyperv_post_message_input *hv_msg;
+@@ -2135,6 +2345,9 @@ static void process_message(VMBus *vmbus)
+     case VMBUS_MSG_UNLOAD:
+         handle_unload(vmbus, msgdata, msglen);
+         break;
++    case VMBUS_MSG_RELID_RELEASED:
++        handle_relid_released(vmbus, msgdata, msglen);
++        break;
+     default:
+         error_report("unknown message type %#x", msg->message_type);
+         break;
+@@ -2152,13 +2365,15 @@ static const struct {
+     void (*run)(VMBus *vmbus);
+     bool (*complete)(VMBus *vmbus);
+ } state_runner[] = {
+-    [VMBUS_LISTEN]         = {process_message,     NULL},
++    [VMBUS_LISTEN]         = {vmbus_listen,        NULL},
+     [VMBUS_HANDSHAKE]      = {send_handshake,      NULL},
+     [VMBUS_OFFER]          = {send_offer,          complete_offer},
+     [VMBUS_CREATE_GPADL]   = {send_create_gpadl,   complete_create_gpadl},
+     [VMBUS_TEARDOWN_GPADL] = {send_teardown_gpadl, complete_teardown_gpadl},
+     [VMBUS_OPEN_CHANNEL]   = {send_open_channel,   complete_open_channel},
+     [VMBUS_UNLOAD]         = {send_unload,         complete_unload},
++    [VMBUS_RESCIND]        = {send_rescind,        complete_rescind},
++    [VMBUS_REOFFER]        = {send_reoffer,        complete_reoffer},
+ };
+ 
+ static void vmbus_do_run(VMBus *vmbus)
+diff --git a/include/hw/hyperv/vmbus.h b/include/hw/hyperv/vmbus.h
+index 4e3ec98..a3ae107 100644
+--- a/include/hw/hyperv/vmbus.h
++++ b/include/hw/hyperv/vmbus.h
+@@ -109,6 +109,15 @@ VMBusChannel *vmbus_device_channel(VMBusDevice *dev, uint32_t chan_idx);
+ uint32_t vmbus_channel_idx(VMBusChannel *chan);
+ bool vmbus_channel_is_open(VMBusChannel *chan);
+ 
++/*
++ * Withdraw the offer of @chan, for a device that lost its backend: the guest
++ * drops the channel instead of waiting on it.  vmbus_channel_reoffer() offers
++ * it again once the guest has released it.
++ */
++void vmbus_channel_rescind(VMBusChannel *chan);
++void vmbus_channel_reoffer(VMBusChannel *chan);
++bool vmbus_channel_is_rescinded(VMBusChannel *chan);
++
+ /*
+  * Notify (on guest's behalf) the host side of the channel that there's data in
+  * the ringbuffer to process.
+-- 
+2.47.3
+

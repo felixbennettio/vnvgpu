@@ -1,0 +1,114 @@
+[PATCH] nvfwd: open the card only once QEMU dropped root
+
+diff --git a/hw/misc/nvfwd/nvfwd.c b/hw/misc/nvfwd/nvfwd.c
+index ac29a38..7c7796b 100644
+--- a/hw/misc/nvfwd/nvfwd.c
++++ b/hw/misc/nvfwd/nvfwd.c
+@@ -8,6 +8,9 @@
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ #include "hw/core/qdev-properties.h"
++#include "qemu/error-report.h"
++#include "system/runstate.h"
++#include "qemu/timer.h"
+ #include <sys/mman.h>
+ #include <poll.h>
+ #include "nvfwd.h"
+@@ -123,6 +126,51 @@ static const MemoryRegionOps mmio_ops = {
+     .impl = { .min_access_size = 4, .max_access_size = 8 },
+ };
+ 
++/*
++ * The driver gives root more than a user, and its limits on a guest are part of the design, so
++ * the card is opened, and the sensor daemon started, only once QEMU has dropped root where it was
++ * told to (-run-with user=, which a management layer that starts QEMU as root uses). QEMU drops it
++ * at the end of its start, which can come after the VM first runs (a VM started at once), so the
++ * open waits for a main loop timer: the main loop runs only after the start is done. The guest's
++ * driver opens the device seconds after that. A QEMU still root then serves no GPU, as with
++ * nogpu=on, and says why.
++ */
++static void nvfwd_open_card(void *opaque)
++{
++    NvfwdState *s = opaque;
++    Error *err = NULL;
++    RusdCard sensor_card;
++
++    if (geteuid() == 0) {
++        error_report("nvfwd: QEMU still runs as root; serving no GPU "
++                     "(start it with -run-with user=, or as a user)");
++        fprintf(s->log, "nvfwd: still root once QEMU started: no GPU\n");
++        fflush(s->log);
++        s->no_gpu = true;
++        return;
++    }
++    if (!host_card_open(s, &err)) {
++        error_report_err(err);
++        fprintf(s->log, "nvfwd: the card would not open: no GPU\n");
++        fflush(s->log);
++        s->no_gpu = true;
++        return;
++    }
++    sensor_card = (RusdCard) { s->card_minor, s->card.gpu_id, s->card.instance };
++    s->sensors = sensors_new(s->log, s->sensord_path, &sensor_card);
++}
++
++static void nvfwd_first_run(void *opaque, bool running, RunState state)
++{
++    NvfwdState *s = opaque;
++
++    if (!running || s->card_opened || s->no_gpu) {
++        return;
++    }
++    s->card_opened = true;
++    timer_mod(s->open_card, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
++}
++
+ static void nvfwd_realize(PCIDevice *pdev, Error **errp)
+ {
+     NvfwdState *s = NVFWD(pdev);
+@@ -133,11 +181,6 @@ static void nvfwd_realize(PCIDevice *pdev, Error **errp)
+         error_setg(errp, "nvfwd needs allow= and log=");
+         return;
+     }
+-    /* The driver gives root more than a user, and its limits on a guest are part of the design. */
+-    if (geteuid() == 0 && !s->no_gpu) {
+-        error_setg(errp, "nvfwd does not run as root");
+-        return;
+-    }
+     s->log = fopen(s->log_path, "a");
+     if (!s->log) {
+         error_setg_errno(errp, errno, "nvfwd log");
+@@ -163,13 +206,8 @@ static void nvfwd_realize(PCIDevice *pdev, Error **errp)
+     callrate_init(&s->rate, s->max_call_rate, s->max_call_burst);
+     s->card_fd = -1;
+     if (!s->no_gpu) {
+-        RusdCard sensor_card;
+-
+-        if (!host_card_open(s, errp)) {
+-            return;
+-        }
+-        sensor_card = (RusdCard) { s->card_minor, s->card.gpu_id, s->card.instance };
+-        s->sensors = sensors_new(s->log, s->sensord_path, &sensor_card);
++        s->open_card = timer_new_ms(QEMU_CLOCK_REALTIME, nvfwd_open_card, s);
++        s->first_run = qemu_add_vm_change_state_handler(nvfwd_first_run, s);
+     }
+     s->win_size = 64 * GiB;
+     window_init(s);
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index 0c73bdb..f399384 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -87,6 +87,10 @@ struct NvfwdState {
+     AllowSet *seen; /* first-seen keys, for the list of forwarded calls */
+     uint32_t seen_count;
+     Sensors *sensors;
++    /* The card is opened when the VM first runs, after QEMU dropped root (-run-with user=). */
++    VMChangeStateEntry *first_run;
++    QEMUTimer *open_card;      /* opens the card from the main loop, after the privilege drop */
++    bool card_opened;
+     Objects *objects;
+     FbInfoSeen fbinfo; /* under lock */
+     Maps *maps;
+-- 
+2.47.3
+

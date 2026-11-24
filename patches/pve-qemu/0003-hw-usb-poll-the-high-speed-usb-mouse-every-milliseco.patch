@@ -1,0 +1,18 @@
+[PATCH 03/43] hw/usb: poll the high-speed usb-mouse every millisecond
+
+diff --git a/hw/usb/dev-hid.c b/hw/usb/dev-hid.c
+index ae19d60..9576925 100644
+--- a/hw/usb/dev-hid.c
++++ b/hw/usb/dev-hid.c
+@@ -133,7 +133,7 @@ static const USBDescIface desc_iface_mouse2 = {
+             .bEndpointAddress      = USB_DIR_IN | 0x01,
+             .bmAttributes          = USB_ENDPOINT_XFER_INT,
+             .wMaxPacketSize        = 4,
+-            .bInterval             = 7, /* 2 ^ (8-1) * 125 usecs = 8 ms */
++            .bInterval             = 4, /* 2 ^ (4-1) * 125 usecs = 1 ms */
+         },
+     },
+ };
+-- 
+2.47.3
+

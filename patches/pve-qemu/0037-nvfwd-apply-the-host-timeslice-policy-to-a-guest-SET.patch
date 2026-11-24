@@ -1,0 +1,61 @@
+[PATCH 37/43] nvfwd: apply the host timeslice policy to a guest SET instead of refusing it
+
+diff --git a/hw/misc/nvfwd/timeslice.c b/hw/misc/nvfwd/timeslice.c
+index fe4ab26..17f9db8 100644
+--- a/hw/misc/nvfwd/timeslice.c
++++ b/hw/misc/nvfwd/timeslice.c
+@@ -70,7 +70,14 @@ void timeslice_created(Timeslice *t, uint32_t client, uint32_t object,
+     }
+ }
+ 
+-uint32_t timeslice_guest_before(Timeslice *t, const uint8_t *arg, uint32_t size)
++/*
++ * A guest's own SET_TIMESLICE on a TSG it owns, while the host holds a policy: the host policy
++ * wins. The request is rewritten to the policy value and forwarded, so RM really applies the
++ * host's value and the guest gets RM's real status (and a later GET reads the applied value).
++ * Refusing it instead made the guest driver fail its own context setup: CUDA sets its TSG's
++ * timeslice while creating a context and answered cudaErrorDevicesUnavailable.
++ */
++uint32_t timeslice_guest_before(Timeslice *t, uint8_t *arg, uint32_t size)
+ {
+     ObjectInfo info;
+     uint64_t pointer, us;
+@@ -88,7 +95,10 @@ uint32_t timeslice_guest_before(Timeslice *t, const uint8_t *arg, uint32_t size)
+         return STATUS_OK; /* do not invent ownership; RM still validates this call */
+     }
+     memcpy(&us, (const void *)(uintptr_t)pointer, sizeof(us));
+-    return us == t->desired_us ? STATUS_OK : STATUS_INSUFFICIENT_PERMISSIONS;
++    if (us != t->desired_us) {
++        memcpy((void *)(uintptr_t)pointer, &t->desired_us, sizeof(t->desired_us));
++    }
++    return STATUS_OK;
+ }
+ 
+ void timeslice_guest_after(Timeslice *t, const uint8_t *arg, uint32_t size, int ret,
+@@ -106,8 +116,8 @@ void timeslice_guest_after(Timeslice *t, const uint8_t *arg, uint32_t size, int
+     }
+     memcpy(&pointer, arg + RM_CONTROL_PARAMS, sizeof(pointer));
+     if (cmd == TSG_SET_TIMESLICE) {
+-        /* A matching guest SET also has a real result. Conflicting requests
+-         * were rejected before ioctl and never arrive here. */
++        /* A guest SET has a real result; a conflicting value was rewritten to the
++         * host policy before the ioctl, so the result is the policy's. */
+         if (objects_get(t->objects, u32(arg), u32(arg + RM_CONTROL_OBJECT), &info) &&
+             info.tsg_owned) {
+             objects_timeslice_result(t->objects, &info, t->desired_us,
+diff --git a/hw/misc/nvfwd/timeslice.h b/hw/misc/nvfwd/timeslice.h
+index b4e7532..fc9819d 100644
+--- a/hw/misc/nvfwd/timeslice.h
++++ b/hw/misc/nvfwd/timeslice.h
+@@ -28,7 +28,7 @@ bool timeslice_gated_call(uint32_t nr, const uint8_t *arg, uint32_t size);
+ /* Locked helpers: caller holds lifecycle through the actual guest ioctl and accounting. */
+ void timeslice_created(Timeslice *t, uint32_t client, uint32_t object,
+                        TimesliceApply *apply, void *opaque);
+-uint32_t timeslice_guest_before(Timeslice *t, const uint8_t *arg, uint32_t size);
++uint32_t timeslice_guest_before(Timeslice *t, uint8_t *arg, uint32_t size);
+ void timeslice_guest_after(Timeslice *t, const uint8_t *arg, uint32_t size, int ret,
+                            TimesliceApply *apply, void *opaque);
+ /* Desired policy persists on partial failure. Returns the number of failed references. */
+-- 
+2.47.3
+

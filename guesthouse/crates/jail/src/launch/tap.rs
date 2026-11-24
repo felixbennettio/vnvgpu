@@ -1,0 +1,67 @@
+//! A bridged network's device, from QEMU's setuid helper, the way QEMU itself asks it: the helper
+//! gets one end of a socket pair, and sends the open device back through it.
+
+use super::Tap;
+use super::handover::{keep_only, place, socket_pair};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::process::Command;
+
+/// The helper's own words for what QEMU asks of it.
+const OFFLOADS: &str = "--use-vnet";
+/// One byte goes with the descriptor, as a message can't be empty.
+const MESSAGE_BYTES: usize = 1;
+
+fn receive_descriptor(socket: &OwnedFd) -> io::Result<OwnedFd> {
+    // SAFETY: this only asks for a size.
+    let space = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as usize;
+    let mut control = vec![0u8; space];
+    let mut byte = [0u8; MESSAGE_BYTES];
+    let mut part = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: byte.len() };
+    // SAFETY: a zeroed msghdr is an empty one, and every pointer set below lives across the call.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &raw mut part;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len();
+    // SAFETY: the message and what it points to are ours and valid for the call.
+    let read = unsafe { libc::recvmsg(socket.as_raw_fd(), &raw mut message, libc::MSG_CMSG_CLOEXEC) };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kernel has filled the control buffer and set its length. The header is checked to be
+    // a descriptor before one is read from it.
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&raw const message);
+        if header.is_null()
+            || (*header).cmsg_level != libc::SOL_SOCKET
+            || (*header).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(io::Error::other("the bridge helper sent no device"));
+        }
+        let fd = libc::CMSG_DATA(header).cast::<RawFd>().read_unaligned();
+        Ok(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+/// Runs the helper and leaves its device open at the tap's number.
+pub fn open(tap: &Tap) -> io::Result<()> {
+    let (ours, theirs) = socket_pair()?;
+    let mut command = Command::new(&tap.helper);
+    command.args([
+        OFFLOADS.to_owned(),
+        format!("--fd={}", theirs.as_raw_fd()),
+        format!("--br={}", tap.bridge),
+    ]);
+    keep_only(&mut command, theirs.as_raw_fd());
+    let mut helper = command
+        .spawn()
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", tap.helper.display())))?;
+    drop(theirs);
+    let device = receive_descriptor(&ours);
+    let done = helper.wait()?;
+    if !done.success() {
+        return Err(io::Error::other(format!("{} could not join {}", tap.helper.display(), tap.bridge)));
+    }
+    place(device?, tap.fd)
+}

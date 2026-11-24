@@ -1,0 +1,743 @@
+[PATCH 33/43] nvfwd: control owned TSG timeslices behind a lifecycle gate
+
+diff --git a/hw/misc/nvfwd/accounting.c b/hw/misc/nvfwd/accounting.c
+index 76933e6..18c0b47 100644
+--- a/hw/misc/nvfwd/accounting.c
++++ b/hw/misc/nvfwd/accounting.c
+@@ -118,6 +118,7 @@ uint32_t account_before(Objects *o, const AccountCall *call, AccountHold *hold)
+     bool known = true;
+ 
+     hold->held = false;
++    hold->created_client = hold->created_object = 0;
+     hold->claim = (ObjectClaim){ MEMORY_NONE, 0 };
+     if (!makes_object(call)) {
+         return STATUS_OK;
+@@ -160,7 +161,7 @@ int account_status_at(uint32_t nr, uint32_t size)
+ }
+ 
+ /* What the driver reports it made. Handles it chose are in the same fields, filled in by now. */
+-static void describe(const AccountCall *call, MemoryKind hold_kind, ObjectInfo *info, uint64_t *bytes)
++static void describe(Objects *o, const AccountCall *call, MemoryKind hold_kind, ObjectInfo *info, uint64_t *bytes)
+ {
+     const uint8_t *arg = call->arg;
+ 
+@@ -169,6 +170,7 @@ static void describe(const AccountCall *call, MemoryKind hold_kind, ObjectInfo *
+     case ESC_RM_ALLOC: {
+         const uint8_t *params = memory_params(call);
+ 
++        info->hclass = read32(arg + RM_ALLOC_CLASS);
+         info->client = read32(arg + RM_ALLOC_ROOT);
+         info->parent = read32(arg + RM_ALLOC_PARENT);
+         info->object = read32(arg + RM_ALLOC_OBJECT);
+@@ -181,17 +183,25 @@ static void describe(const AccountCall *call, MemoryKind hold_kind, ObjectInfo *
+         break;
+     }
+     case ESC_RM_ALLOC_MEMORY:
++        info->hclass = read32(arg + RM_MEMORY_CLASS);
+         info->client = read32(arg + RM_MEMORY_ROOT);
+         info->parent = read32(arg + RM_MEMORY_PARENT);
+         info->object = read32(arg + RM_MEMORY_OBJECT);
+         info->host_range = call->host_range;
+         info->host_bytes = call->host_bytes;
+         break;
+-    case ESC_RM_DUP_OBJECT:
++    case ESC_RM_DUP_OBJECT: {
++        ObjectInfo source;
++        info->hclass = UINT32_MAX;
++        if (objects_get(o, read32(arg + RM_DUP_SOURCE_CLIENT),
++                        read32(arg + RM_DUP_SOURCE_OBJECT), &source) && !source.local) {
++            info->hclass = source.hclass;
++        }
+         info->client = read32(arg + RM_DUP_CLIENT);
+         info->parent = read32(arg + RM_DUP_PARENT);
+         info->object = read32(arg + RM_DUP_OBJECT);
+         break;
++    }
+     case ESC_RM_ALLOC_CONTEXT_DMA2:
+         info->client = read32(arg + RM_DMA_ROOT);
+         info->parent = read32(arg + RM_DMA_PARENT);
+@@ -226,7 +236,9 @@ bool account_after(Objects *o, const AccountCall *call, AccountHold *hold)
+         ObjectInfo info = { 0 };
+         uint64_t bytes = hold->claim.bytes;
+ 
+-        describe(call, hold->claim.kind, &info, &bytes);
++        describe(o, call, hold->claim.kind, &info, &bytes);
++        hold->created_client = info.client;
++        hold->created_object = info.object;
+         objects_add(o, &hold->claim, bytes, &info);
+         return true;
+     }
+diff --git a/hw/misc/nvfwd/accounting.h b/hw/misc/nvfwd/accounting.h
+index 240fff1..c962530 100644
+--- a/hw/misc/nvfwd/accounting.h
++++ b/hw/misc/nvfwd/accounting.h
+@@ -25,6 +25,7 @@ typedef struct AccountCall {
+ typedef struct AccountHold {
+     ObjectClaim claim;
+     bool held;
++    uint32_t created_client, created_object;
+ } AccountHold;
+ 
+ /* STATUS_OK to send the call on, or the status to answer it with. */
+diff --git a/hw/misc/nvfwd/fds.c b/hw/misc/nvfwd/fds.c
+index dedd3b5..0a499e3 100644
+--- a/hw/misc/nvfwd/fds.c
++++ b/hw/misc/nvfwd/fds.c
+@@ -28,7 +28,7 @@ bool fd_hold(NvfwdState *s, uint32_t id)
+     return held;
+ }
+ 
+-void fd_release(NvfwdState *s, uint32_t id)
++void fd_release_locked(NvfwdState *s, uint32_t id)
+ {
+     int closing = -1;
+ 
+@@ -43,10 +43,18 @@ void fd_release(NvfwdState *s, uint32_t id)
+     }
+ }
+ 
++void fd_release(NvfwdState *s, uint32_t id)
++{
++    timeslice_enter(&s->timeslice);
++    fd_release_locked(s, id);
++    timeslice_leave(&s->timeslice);
++}
++
+ void fd_close(NvfwdState *s, uint32_t id)
+ {
+     int fd;
+ 
++    timeslice_enter(&s->timeslice);
+     qemu_mutex_lock(&s->lock);
+     fd = s->fds[id];
+     s->fds[id] = -1;
+@@ -58,6 +66,11 @@ void fd_close(NvfwdState *s, uint32_t id)
+     if (fd >= 0) {
+         close(fd);
+     }
++    objects_file_closed(s->objects, id);
++    if (s->sensors) {
++        sensors_file_closed(s->sensors, id);
++    }
++    timeslice_leave(&s->timeslice);
+ }
+ 
+ 
+diff --git a/hw/misc/nvfwd/forward.c b/hw/misc/nvfwd/forward.c
+index 5c06da2..78b4a8a 100644
+--- a/hw/misc/nvfwd/forward.c
++++ b/hw/misc/nvfwd/forward.c
+@@ -93,7 +93,8 @@ static int filter_rm(NvfwdState *s, uint32_t nr, uint8_t *arg, uint32_t size)
+             return -EINVAL;
+         }
+         memcpy(&cmd, arg + 8, 4);
+-        if (set_has(qatomic_read(&s->allow), KEY(K_EMUCTRL, cmd))) {
++        if (cmd != TSG_SET_TIMESLICE && cmd != TSG_SCHEDULE &&
++            set_has(qatomic_read(&s->allow), KEY(K_EMUCTRL, cmd))) {
+             /* Answered here with success: unknown or unwanted on the host. */
+             uint32_t st = 0;
+             note_local(s, "ctrl", K_EMUCTRL, cmd);
+@@ -418,7 +419,13 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+         }
+     }
+     if (nr == ESC_RM_CONTROL) {
++        uint32_t policy_status = timeslice_guest_before(&s->timeslice, arg, size);
+         uint32_t cmd, hclient, hobj, params_size;
++        if (policy_status) {
++            memcpy(arg + RM_CONTROL_STATUS, &policy_status, sizeof(policy_status));
++            r->ret = 0;
++            return;
++        }
+         uint64_t params;
+         memcpy(&hclient, arg + RM_CONTROL_CLIENT, 4);
+         memcpy(&cmd, arg + RM_CONTROL_CMD, 4);
+@@ -482,10 +489,17 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+         qemu_mutex_lock(&s->lock);
+         retained = account_after(s->objects, &account, &hold);
+         qemu_mutex_unlock(&s->lock);
++        if (retained) {
++            timeslice_created(&s->timeslice, hold.created_client, hold.created_object,
++                              host_timeslice_apply, s);
++        }
+         if (!retained) {
+             undo_runs(&account); /* the object that would have owned these pages does not exist */
+         }
+     }
++    if (!uvm && nr == ESC_RM_CONTROL) {
++        timeslice_guest_after(&s->timeslice, arg, size, r->ret, host_timeslice_apply, s);
++    }
+     if (s->trace) {
+         uint32_t a[10] = { 0 };
+         memcpy(a, arg, MIN(size, sizeof(a)));
+@@ -499,13 +513,34 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+ void do_ioctl(NvfwdState *s, Bounce *b)
+ {
+     uint32_t held[NVFWD_MAX_FIX], nheld = 0;
++    RmCall parsed = { 0 };
++    bool gated = false;
+ 
++    /* Parse the private bounce buffer before selecting the lifecycle gate.
++     * Validation is repeated inside it; malformed calls never reach RM. */
++    if (host_fd(s, b->req.fdid) >= 0 &&
++        s->fd_kind[b->req.fdid] != NVFWD_DEV_UVM &&
++        rmargs_parse(&parsed, b->req.cmd, b->data, b->req.len,
++                     b->req.fix, b->req.nfix)) {
++        gated = timeslice_gated_call(parsed.nr, b->data + parsed.arg_at, parsed.size);
++    }
++    if (gated) {
++        timeslice_enter(&s->timeslice);
++    }
+     if (host_fd(s, b->req.fdid) < 0) {
+         b->req.ret = -EBADF;
+-        return;
++        goto out;
+     }
+     forward_ioctl(s, b, held, &nheld);
+     while (nheld) {
+-        fd_release(s, held[--nheld]);
++        if (gated) {
++            fd_release_locked(s, held[--nheld]);
++        } else {
++            fd_release(s, held[--nheld]);
++        }
++    }
++out:
++    if (gated) {
++        timeslice_leave(&s->timeslice);
+     }
+ }
+diff --git a/hw/misc/nvfwd/host_timeslice.c b/hw/misc/nvfwd/host_timeslice.c
+new file mode 100644
+index 0000000..d3e1f2a
+--- /dev/null
++++ b/hw/misc/nvfwd/host_timeslice.c
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include "nvfwd.h"
++
++/* lifecycle is held. Its root fd owns the client and cannot be closed/reused
++ * until the ioctl and pin release have finished. No global GPU handle lookup. */
++TimesliceResult host_timeslice_apply(void *opaque, const ObjectInfo *info, uint64_t us)
++{
++    NvfwdState *s = opaque;
++    TimesliceResult result = { .error = EBADF };
++    if (fd_hold(s, info->root_file)) {
++        result = timeslice_ioctl(host_fd(s, info->root_file), info, us);
++        fd_release_locked(s, info->root_file);
++    }
++    return result;
++}
+diff --git a/hw/misc/nvfwd/meson.build b/hw/misc/nvfwd/meson.build
+index ce35da7..d056d4b 100644
+--- a/hw/misc/nvfwd/meson.build
++++ b/hw/misc/nvfwd/meson.build
+@@ -2,6 +2,8 @@
+ nvfwd_ss = files(
+   'callrate.c',
+   'objects.c',
++  'timeslice.c',
++  'host_timeslice.c',
+   'maps.c',
+   'runs.c',
+   'bounce.c',
+diff --git a/hw/misc/nvfwd/nvfwd.c b/hw/misc/nvfwd/nvfwd.c
+index e9b13c1..ec37ec0 100644
+--- a/hw/misc/nvfwd/nvfwd.c
++++ b/hw/misc/nvfwd/nvfwd.c
+@@ -40,10 +40,6 @@ static void handle(NvfwdState *s, uint32_t slot)
+     case NVFWD_OP_CLOSE:
+         if (held) {
+             fd_close(s, r->fdid);
+-            objects_file_closed(s->objects, r->fdid);
+-            if (s->sensors) {
+-                sensors_file_closed(s->sensors, r->fdid);
+-            }
+         }
+         r->ret = 0;
+         break;
+@@ -162,6 +158,7 @@ static void nvfwd_realize(PCIDevice *pdev, Error **errp)
+         .max_objects = s->max_objects,
+         .max_bytes = { [MEMORY_VIDEO] = s->max_vram, [MEMORY_SYSTEM] = s->max_sysmem },
+     }, unmap_runs, s);
++    timeslice_init(&s->timeslice, s->objects);
+     s->maps = maps_new(s->max_maps, s->max_uvm);
+     callrate_init(&s->rate, s->max_call_rate, s->max_call_burst);
+     s->card_fd = -1;
+@@ -289,6 +286,53 @@ static void nvfwd_get_admission_reservation(Object *obj, Visitor *v, const char
+     visit_type_uint64(v, name, &bytes, errp);
+ }
+ 
++static void nvfwd_get_timeslice(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    uint64_t us;
++    if (!nvfwd_budget_ready(obj, errp)) {
++        return;
++    }
++    timeslice_enter(&s->timeslice);
++    us = s->timeslice.desired_us;
++    timeslice_leave(&s->timeslice);
++    visit_type_uint64(v, name, &us, errp);
++}
++
++static void nvfwd_set_timeslice(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    int64_t us;
++    uint32_t failed;
++    if (!nvfwd_budget_ready(obj, errp) || !visit_type_int64(v, name, &us, errp)) {
++        return;
++    }
++    if (s->no_gpu || us <= 0) {
++        error_setg(errp, "timeslice-us requires a GPU and a value in 1..INT64_MAX");
++        return;
++    }
++    failed = timeslice_set(&s->timeslice, us, host_timeslice_apply, s);
++    if (failed) {
++        error_setg(errp, "timeslice policy retained; %u TSG references failed; read timeslice-status",
++                   failed);
++    }
++}
++
++static void nvfwd_get_timeslice_status(Object *obj, Visitor *v, const char *name,
++                                       void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    char *text;
++    if (!nvfwd_budget_ready(obj, errp)) {
++        return;
++    }
++    text = timeslice_report(&s->timeslice);
++    visit_type_str(v, name, &text, errp);
++    g_free(text);
++}
++
+ static const Property nvfwd_props[] = {
+     DEFINE_PROP_STRING("allow", NvfwdState, allow_path),
+     DEFINE_PROP_STRING("sensord", NvfwdState, sensord_path),
+@@ -329,6 +373,14 @@ static void nvfwd_class_init(ObjectClass *class, const void *data)
+                               nvfwd_get_admission_reservation, NULL, NULL, NULL);
+     object_class_property_set_description(class, "admission-reservation-bytes",
+         "Atomic max of live VIDEO limit and charged bytes; host must serialize budget changes");
++    object_class_property_add(class, "timeslice-us", "uint64",
++                              nvfwd_get_timeslice, nvfwd_set_timeslice, NULL, NULL);
++    object_class_property_set_description(class, "timeslice-us",
++        "Desired nonzero TSG timeslice; partial errors retain policy; not hardware readback");
++    object_class_property_add(class, "timeslice-status", "str",
++                              nvfwd_get_timeslice_status, NULL, NULL, NULL);
++    object_class_property_set_description(class, "timeslice-status",
++        "Per-owned-reference generation and last actual timeslice errno/RM status");
+     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+ }
+ 
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index 678e234..c5e3acf 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -21,6 +21,7 @@
+ #include "nvfwd_proto.h"
+ #include "objects.h"
+ #include "sensors.h"
++#include "timeslice.h"
+ 
+ #define TYPE_NVFWD "nvfwd"
+ OBJECT_DECLARE_SIMPLE_TYPE(NvfwdState, NVFWD)
+@@ -49,6 +50,7 @@ struct NvfwdState {
+     int card_fd;               /* the card's device file, open while the VM is */
+     NvfwdCard card;
+ 
++    Timeslice timeslice; /* lifecycle -> lock -> Objects */
+     QemuMutex lock;
+     int fds[MAX_FDS];
+     uint8_t fd_kind[MAX_FDS];
+@@ -110,6 +112,8 @@ void throttle(NvfwdState *s);
+ int host_fd(NvfwdState *s, uint32_t id);
+ bool fd_hold(NvfwdState *s, uint32_t id);
+ void fd_release(NvfwdState *s, uint32_t id);
++void fd_release_locked(NvfwdState *s, uint32_t id); /* lifecycle already held */
++TimesliceResult host_timeslice_apply(void *opaque, const ObjectInfo *info, uint64_t us);
+ void fd_close(NvfwdState *s, uint32_t id);
+ void do_open(NvfwdState *s, struct nvfwd_req *r);
+ 
+diff --git a/hw/misc/nvfwd/objects.c b/hw/misc/nvfwd/objects.c
+index daee87c..2c051b2 100644
+--- a/hw/misc/nvfwd/objects.c
++++ b/hw/misc/nvfwd/objects.c
+@@ -20,6 +20,7 @@ struct Objects {
+     void *opaque;
+     uint32_t count; /* entries and claims */
+     uint64_t used[MEMORY_KINDS];
++    uint64_t generation;
+ };
+ 
+ static uint64_t key_of(uint32_t client, uint32_t object)
+@@ -124,6 +125,12 @@ void objects_add(Objects *o, const ObjectClaim *claim, uint64_t bytes, const Obj
+     e->bytes = bytes;
+     e->key = key_of(info->client, info->object);
+     g_mutex_lock(&o->lock);
++    /* Exhaustion fails closed: generation 0 can never be a control target. */
++    e->info.generation = o->generation == UINT64_MAX ? 0 : ++o->generation;
++    e->info.timeslice_attempted = false;
++    e->info.timeslice_us = 0;
++    e->info.timeslice_errno = 0;
++    e->info.timeslice_status = 0;
+     drop_claim(o, claim);
+     /* A handle used again means the driver dropped the old object without being asked here. */
+     if (find(o, info->client, info->object)) {
+@@ -243,3 +250,66 @@ uint64_t objects_reservation(Objects *o, MemoryKind kind)
+     g_mutex_unlock(&o->lock);
+     return bytes;
+ }
++
++/* All ancestry is resolved under one Objects lock. We never infer class from a
++ * numeric handle or from another process's GPU channel list. */
++static void snapshot(Objects *o, Entry *e, ObjectInfo *info)
++{
++    Entry *root = find(o, e->info.client, e->info.client);
++    Entry *parent = find(o, e->info.client, e->info.parent);
++    *info = e->info;
++    info->root_file = root ? root->info.file : UINT32_MAX;
++    info->tsg_owned = info->generation && !info->local && info->hclass == 0xa06c &&
++        root && !root->info.local && root->info.parent == root->info.object &&
++        (root->info.hclass == 0 || root->info.hclass == 0x41) &&
++        parent && !parent->info.local && parent->info.hclass == 0x80;
++}
++
++bool objects_get(Objects *o, uint32_t client, uint32_t object, ObjectInfo *info)
++{
++    Entry *e;
++    g_mutex_lock(&o->lock);
++    e = find(o, client, object);
++    if (e) {
++        snapshot(o, e, info);
++    }
++    g_mutex_unlock(&o->lock);
++    return e != NULL;
++}
++
++ObjectInfo *objects_tsg_refs(Objects *o, uint32_t *count)
++{
++    GHashTableIter it;
++    Entry *e;
++    ObjectInfo *refs;
++    *count = 0;
++    g_mutex_lock(&o->lock);
++    refs = g_new(ObjectInfo, g_hash_table_size(o->entries));
++    g_hash_table_iter_init(&it, o->entries);
++    while (g_hash_table_iter_next(&it, NULL, (void **)&e)) {
++        if (!e->info.local && (e->info.hclass == 0xa06c ||
++                              e->info.hclass == UINT32_MAX)) {
++            snapshot(o, e, &refs[(*count)++]);
++        }
++    }
++    g_mutex_unlock(&o->lock);
++    return refs;
++}
++
++bool objects_timeslice_result(Objects *o, const ObjectInfo *ref, uint64_t us,
++                              int error, uint32_t status)
++{
++    Entry *e;
++    bool same;
++    g_mutex_lock(&o->lock);
++    e = find(o, ref->client, ref->object);
++    same = e && ref->generation && e->info.generation == ref->generation;
++    if (same) {
++        e->info.timeslice_attempted = ref->tsg_owned;
++        e->info.timeslice_us = us;
++        e->info.timeslice_errno = error;
++        e->info.timeslice_status = status;
++    }
++    g_mutex_unlock(&o->lock);
++    return same;
++}
+diff --git a/hw/misc/nvfwd/objects.h b/hw/misc/nvfwd/objects.h
+index 4188a5a..5e4dc7b 100644
+--- a/hw/misc/nvfwd/objects.h
++++ b/hw/misc/nvfwd/objects.h
+@@ -27,6 +27,14 @@ typedef struct ObjectClaim {
+ 
+ typedef struct ObjectInfo {
+     uint32_t client, parent, object, file;
++    uint32_t hclass; /* actual RM_ALLOC class; UINT32_MAX for an unclassified DUP */
++    uint64_t generation; /* assigned once by Objects, never copied from a DUP */
++    uint32_t root_file; /* filled by snapshots from this reference's owning root */
++    bool tsg_owned; /* snapshot: known real a06c under an owned Device/root */
++    bool timeslice_attempted;
++    uint64_t timeslice_us;
++    int timeslice_errno;
++    uint32_t timeslice_status;
+     bool local;       /* answered in the device: the host has no such object */
+     void *host_range; /* guest pages mapped for the driver, unmapped when the object goes */
+     uint64_t host_bytes;
+@@ -68,4 +76,11 @@ void objects_set_limit(Objects *o, MemoryKind kind, uint64_t limit);
+ /* One snapshot for host admission: max(live limit, charged bytes). */
+ uint64_t objects_reservation(Objects *o, MemoryKind kind);
+ 
++/* Snapshots are not lifetime pins. Caller holds the external lifecycle gate
++ * across lookup, actual driver operation and result recording. */
++bool objects_get(Objects *o, uint32_t client, uint32_t object, ObjectInfo *info);
++ObjectInfo *objects_tsg_refs(Objects *o, uint32_t *count); /* g_free result */
++bool objects_timeslice_result(Objects *o, const ObjectInfo *ref, uint64_t us,
++                              int error, uint32_t status);
++
+ #endif
+diff --git a/hw/misc/nvfwd/rm_layout.h b/hw/misc/nvfwd/rm_layout.h
+index 4c00adf..4404c73 100644
+--- a/hw/misc/nvfwd/rm_layout.h
++++ b/hw/misc/nvfwd/rm_layout.h
+@@ -88,6 +88,7 @@
+ #define RM_DUP_PARENT 4
+ #define RM_DUP_OBJECT 8
+ #define RM_DUP_SOURCE_CLIENT 12
++#define RM_DUP_SOURCE_OBJECT 16
+ #define RM_DUP_STATUS 24
+ #define RM_DMA_BYTES 56u
+ #define RM_DMA_ROOT 0
+@@ -103,6 +104,7 @@
+ #define ATTR_LOCATION_VIDMEM 0
+ 
+ #define STATUS_OK 0
++#define STATUS_INSUFFICIENT_PERMISSIONS 0x1b
+ #define STATUS_INSUFFICIENT_RESOURCES 0x1a
+ #define STATUS_INVALID_ARGUMENT 0x1f
+ #define STATUS_INVALID_CLASS 0x22 /* what the RM says to a device instance it doesn't have */
+diff --git a/hw/misc/nvfwd/timeslice.c b/hw/misc/nvfwd/timeslice.c
+new file mode 100644
+index 0000000..ed3fec2
+--- /dev/null
++++ b/hw/misc/nvfwd/timeslice.c
+@@ -0,0 +1,185 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Owned TSG references, real control outcomes, and the narrow lifecycle gate.
++ * This is requested policy, not hardware readback or a fairness guarantee. */
++#include "timeslice.h"
++#include "rm_layout.h"
++#include <errno.h>
++#include <string.h>
++#include <sys/ioctl.h>
++
++static uint32_t u32(const uint8_t *p)
++{
++    uint32_t v;
++    memcpy(&v, p, sizeof(v));
++    return v;
++}
++
++void timeslice_init(Timeslice *t, Objects *objects)
++{
++    g_mutex_init(&t->lifecycle);
++    t->objects = objects;
++    t->desired_us = 0;
++}
++
++void timeslice_enter(Timeslice *t) { g_mutex_lock(&t->lifecycle); }
++void timeslice_leave(Timeslice *t) { g_mutex_unlock(&t->lifecycle); }
++
++bool timeslice_gated_call(uint32_t nr, const uint8_t *arg, uint32_t size)
++{
++    switch (nr) {
++    case ESC_RM_ALLOC:
++    case ESC_RM_ALLOC_MEMORY:
++    case ESC_RM_DUP_OBJECT:
++    case ESC_RM_ALLOC_CONTEXT_DMA2:
++    case ESC_RM_VID_HEAP_CONTROL:
++    case ESC_RM_FREE:
++        return true;
++    case ESC_RM_CONTROL:
++        return size >= RM_CONTROL_BYTES &&
++               (u32(arg + RM_CONTROL_CMD) == TSG_SCHEDULE ||
++                u32(arg + RM_CONTROL_CMD) == TSG_SET_TIMESLICE);
++    default:
++        return false;
++    }
++}
++
++static void apply_one(Timeslice *t, const ObjectInfo *info,
++                      TimesliceApply *apply, void *opaque)
++{
++    TimesliceResult r = { .error = ESTALE };
++    ObjectInfo now;
++    if (info->tsg_owned &&
++        objects_get(t->objects, info->client, info->object, &now) &&
++        now.generation == info->generation && now.tsg_owned) {
++        r = apply(opaque, &now, t->desired_us);
++    }
++    objects_timeslice_result(t->objects, info, t->desired_us, r.error, r.status);
++}
++
++void timeslice_created(Timeslice *t, uint32_t client, uint32_t object,
++                       TimesliceApply *apply, void *opaque)
++{
++    ObjectInfo info;
++    if (t->desired_us && objects_get(t->objects, client, object, &info) &&
++        (info.hclass == TSG_CLASS || info.hclass == TSG_UNKNOWN_CLASS)) {
++        /* ALLOC alone is not proof of schedulability. Keep the real failure;
++         * a later successful SCHEDULE retries before returning to the guest. */
++        apply_one(t, &info, apply, opaque);
++    }
++}
++
++uint32_t timeslice_guest_before(Timeslice *t, const uint8_t *arg, uint32_t size)
++{
++    ObjectInfo info;
++    uint64_t pointer, us;
++    if (size != RM_CONTROL_BYTES ||
++        u32(arg + RM_CONTROL_CMD) != TSG_SET_TIMESLICE || !t->desired_us) {
++        return STATUS_OK;
++    }
++    memcpy(&pointer, arg + RM_CONTROL_PARAMS, sizeof(pointer));
++    /* Called only after rmargs/apply_fields validated and rewrote this pointer. */
++    if (!pointer || u32(arg + RM_CONTROL_PARAMS_SIZE) != sizeof(us)) {
++        return STATUS_INVALID_ARGUMENT;
++    }
++    if (!objects_get(t->objects, u32(arg), u32(arg + RM_CONTROL_OBJECT), &info) ||
++        !info.tsg_owned) {
++        return STATUS_OK; /* do not invent ownership; RM still validates this call */
++    }
++    memcpy(&us, (const void *)(uintptr_t)pointer, sizeof(us));
++    return us == t->desired_us ? STATUS_OK : STATUS_INSUFFICIENT_PERMISSIONS;
++}
++
++void timeslice_guest_after(Timeslice *t, const uint8_t *arg, uint32_t size, int ret,
++                           TimesliceApply *apply, void *opaque)
++{
++    uint64_t pointer;
++    uint32_t cmd;
++    ObjectInfo info;
++    if (size != RM_CONTROL_BYTES) {
++        return;
++    }
++    cmd = u32(arg + RM_CONTROL_CMD);
++    if ((cmd != TSG_SCHEDULE && cmd != TSG_SET_TIMESLICE) || !t->desired_us) {
++        return; /* other controls do not hold lifecycle */
++    }
++    memcpy(&pointer, arg + RM_CONTROL_PARAMS, sizeof(pointer));
++    if (cmd == TSG_SET_TIMESLICE) {
++        /* A matching guest SET also has a real result. Conflicting requests
++         * were rejected before ioctl and never arrive here. */
++        if (objects_get(t->objects, u32(arg), u32(arg + RM_CONTROL_OBJECT), &info) &&
++            info.tsg_owned) {
++            objects_timeslice_result(t->objects, &info, t->desired_us,
++                                     ret < 0 ? -ret : 0,
++                                     ret < 0 ? 0 : u32(arg + RM_CONTROL_STATUS));
++        }
++        return;
++    }
++    if (ret >= 0 && u32(arg + RM_CONTROL_STATUS) == STATUS_OK && pointer &&
++        u32(arg + RM_CONTROL_PARAMS_SIZE) == 3 &&
++        *(const uint8_t *)(uintptr_t)pointer == 1) {
++        timeslice_created(t, u32(arg), u32(arg + RM_CONTROL_OBJECT), apply, opaque);
++    }
++}
++
++uint32_t timeslice_set(Timeslice *t, uint64_t us, TimesliceApply *apply, void *opaque)
++{
++    uint32_t count, failed = 0;
++    ObjectInfo *refs;
++    g_assert(us != 0);
++    timeslice_enter(t);
++    t->desired_us = us;
++    refs = objects_tsg_refs(t->objects, &count);
++    for (uint32_t i = 0; i < count; i++) {
++        ObjectInfo now;
++        apply_one(t, &refs[i], apply, opaque);
++        if (!objects_get(t->objects, refs[i].client, refs[i].object, &now) ||
++            now.generation != refs[i].generation || now.timeslice_errno ||
++            now.timeslice_status || now.timeslice_us != us) {
++            failed++;
++        }
++    }
++    g_free(refs);
++    timeslice_leave(t);
++    return failed;
++}
++
++char *timeslice_report(Timeslice *t)
++{
++    uint32_t count;
++    ObjectInfo *refs;
++    GString *s = g_string_new(NULL);
++    timeslice_enter(t);
++    refs = objects_tsg_refs(t->objects, &count);
++    g_string_append_printf(s, "version=1 requested_us=%" G_GUINT64_FORMAT
++                           " scope=requested-not-hardware references=%u\n", t->desired_us, count);
++    for (uint32_t i = 0; i < count; i++) {
++        ObjectInfo *r = &refs[i];
++        g_string_append_printf(s, "client=%#x object=%#x generation=%" G_GUINT64_FORMAT
++            " owned=%u attempted=%u requested_us=%" G_GUINT64_FORMAT
++            " errno=%d rm_status=%#x\n", r->client, r->object, r->generation,
++            r->tsg_owned, r->timeslice_attempted, r->timeslice_us,
++            r->timeslice_errno, r->timeslice_status);
++    }
++    g_free(refs);
++    timeslice_leave(t);
++    return g_string_free(s, FALSE);
++}
++
++TimesliceResult timeslice_ioctl(int fd, const ObjectInfo *info, uint64_t us)
++{
++    /* NVOS54_PARAMETERS, 615 nvos.h. The ioctl encodes its exact 32-byte size. */
++    struct {
++        uint32_t client, object, command, flags;
++        uint64_t params;
++        uint32_t params_size, status;
++    } control = { .client = info->client, .object = info->object,
++                  .command = TSG_SET_TIMESLICE, .params = (uintptr_t)&us,
++                  .params_size = sizeof(us) };
++    int rc;
++    _Static_assert(sizeof(control) == RM_CONTROL_BYTES, "NVOS54 layout");
++    do {
++        rc = ioctl(fd, _IOWR('F', ESC_RM_CONTROL, control), &control);
++    } while (rc < 0 && errno == EINTR);
++    return (TimesliceResult) { .error = rc < 0 ? errno : 0,
++                              .status = rc < 0 ? 0 : control.status };
++}
+diff --git a/hw/misc/nvfwd/timeslice.h b/hw/misc/nvfwd/timeslice.h
+new file mode 100644
+index 0000000..cb9a0c6
+--- /dev/null
++++ b/hw/misc/nvfwd/timeslice.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef NVFWD_TIMESLICE_H
++#define NVFWD_TIMESLICE_H
++#include <glib.h>
++#include "objects.h"
++
++#define TSG_CLASS 0xa06cu
++#define TSG_SCHEDULE 0xa06c0101u
++#define TSG_SET_TIMESLICE 0xa06c0103u
++#define TSG_UNKNOWN_CLASS UINT32_MAX
++
++typedef struct Timeslice {
++    /* Always active, including before policy is enabled. Lock order:
++     * lifecycle, NvfwdState.lock, Objects.lock. Never reverse it. */
++    GMutex lifecycle;
++    Objects *objects;
++    uint64_t desired_us;
++} Timeslice;
++
++typedef struct TimesliceResult { int error; uint32_t status; } TimesliceResult;
++typedef TimesliceResult TimesliceApply(void *opaque, const ObjectInfo *info, uint64_t us);
++void timeslice_init(Timeslice *t, Objects *objects);
++void timeslice_enter(Timeslice *t);
++void timeslice_leave(Timeslice *t);
++bool timeslice_gated_call(uint32_t nr, const uint8_t *arg, uint32_t size);
++/* Locked helpers: caller holds lifecycle through the actual guest ioctl and accounting. */
++void timeslice_created(Timeslice *t, uint32_t client, uint32_t object,
++                       TimesliceApply *apply, void *opaque);
++uint32_t timeslice_guest_before(Timeslice *t, const uint8_t *arg, uint32_t size);
++void timeslice_guest_after(Timeslice *t, const uint8_t *arg, uint32_t size, int ret,
++                           TimesliceApply *apply, void *opaque);
++/* Desired policy persists on partial failure. Returns the number of failed references. */
++uint32_t timeslice_set(Timeslice *t, uint64_t us, TimesliceApply *apply, void *opaque);
++char *timeslice_report(Timeslice *t);
++TimesliceResult timeslice_ioctl(int fd, const ObjectInfo *info, uint64_t us);
++#endif
+-- 
+2.47.3
+

@@ -1,0 +1,50 @@
+[PATCH 05/43] hw/hyperv: keep reading a GPU-PV channel until a pass finds nothing
+
+diff --git a/hw/hyperv/gpupv.c b/hw/hyperv/gpupv.c
+index f0b0f3a..6a3bfbd 100644
+--- a/hw/hyperv/gpupv.c
++++ b/hw/hyperv/gpupv.c
+@@ -169,18 +169,31 @@ static void gpupv_chan_notify(VMBusChannel *chan)
+ {
+     GpupvChannel *s = GPUPV_CHANNEL(vmbus_channel_device(chan));
+     VMBusChanReq *req;
++    bool got_packet;
+ 
+     gpupv_flush(s);
+ 
+-    if (vmbus_channel_recv_start(chan)) {
+-        return;
+-    }
+-    while ((req = vmbus_channel_recv_peek(chan, sizeof(*req)))) {
+-        gpupv_forward(s, req);
+-        vmbus_free_req(req);
+-        vmbus_channel_recv_pop(chan);
+-    }
+-    vmbus_channel_recv_done(chan);
++    /*
++     * The guest signals only when it finds the ring empty. A packet it writes
++     * after recv_start has read write_index, but before recv_done has moved
++     * read_index, finds it not empty, so no signal comes for it, and nothing
++     * else would make us look. So read until a whole pass finds nothing.
++     * Traffic where each packet waits for its reply rarely hits this. Packets
++     * that nobody replies to, such as asynchronous messages, hit it in seconds.
++     */
++    do {
++        got_packet = false;
++        if (vmbus_channel_recv_start(chan)) {
++            return;
++        }
++        while ((req = vmbus_channel_recv_peek(chan, sizeof(*req)))) {
++            gpupv_forward(s, req);
++            vmbus_free_req(req);
++            vmbus_channel_recv_pop(chan);
++            got_packet = true;
++        }
++        vmbus_channel_recv_done(chan);
++    } while (got_packet);
+ }
+ 
+ static void gpupv_drop_arena(GpupvChannel *s)
+-- 
+2.47.3
+

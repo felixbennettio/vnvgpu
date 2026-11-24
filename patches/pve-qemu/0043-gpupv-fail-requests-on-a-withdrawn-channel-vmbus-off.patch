@@ -1,0 +1,91 @@
+[PATCH 43/43] gpupv: fail requests on a withdrawn channel; vmbus: offer again only once the guest released every withdrawn channel
+
+diff --git a/hw/hyperv/gpupv.c b/hw/hyperv/gpupv.c
+index adf1f65..ed33d6b 100644
+--- a/hw/hyperv/gpupv.c
++++ b/hw/hyperv/gpupv.c
+@@ -161,6 +161,15 @@ static void gpupv_flush(GpupvChannel *s)
+     }
+ }
+ 
++static void gpupv_queue_empty_completion(GpupvChannel *s, uint64_t tid)
++{
++    GpupvOut *o = g_malloc0(sizeof(*o));
++
++    o->type = VMBUS_PACKET_COMP;
++    o->tid = tid;
++    g_queue_push_tail(&s->out, o);
++}
++
+ static void gpupv_forward(GpupvChannel *s, VMBusChanReq *req)
+ {
+     uint16_t flags = req->need_comp ? GPUPV_FRAME_NEED_COMP : 0;
+@@ -211,14 +220,25 @@ static void gpupv_chan_notify(VMBusChannel *chan)
+             return;
+         }
+         while ((req = vmbus_channel_recv_peek(chan, sizeof(*req)))) {
+-            /* With no backend the packet has nowhere to go; it is dropped. */
+-            gpupv_forward(s, req);
++            if (s->backend_lost || vmbus_channel_is_rescinded(chan)) {
++                /*
++                 * The channel is being withdrawn: no backend, or one that never
++                 * knew this channel's objects. A request that waits for an
++                 * answer fails at once.
++                 */
++                if (req->need_comp) {
++                    gpupv_queue_empty_completion(s, req->transaction_id);
++                }
++            } else {
++                gpupv_forward(s, req);
++            }
+             vmbus_free_req(req);
+             vmbus_channel_recv_pop(chan);
+             got_packet = true;
+         }
+         vmbus_channel_recv_done(chan);
+     } while (got_packet);
++    gpupv_flush(s);
+ }
+ 
+ static void gpupv_drop_arena(GpupvChannel *s)
+@@ -350,11 +370,7 @@ static void gpupv_complete_unanswered(GpupvChannel *s)
+ 
+     g_hash_table_iter_init(&it, s->unanswered);
+     while (g_hash_table_iter_next(&it, &key, NULL)) {
+-        GpupvOut *o = g_malloc0(sizeof(*o));
+-
+-        o->type = VMBUS_PACKET_COMP;
+-        o->tid = *(uint64_t *)key;
+-        g_queue_push_tail(&s->out, o);
++        gpupv_queue_empty_completion(s, *(uint64_t *)key);
+     }
+     g_hash_table_remove_all(s->unanswered);
+     if (n) {
+diff --git a/hw/hyperv/vmbus.c b/hw/hyperv/vmbus.c
+index a5a4c92..bb14474 100644
+--- a/hw/hyperv/vmbus.c
++++ b/hw/hyperv/vmbus.c
+@@ -2288,6 +2288,12 @@ static void vmbus_listen(VMBus *vmbus)
+                 return;
+             }
+         }
++        /* Nothing is offered again while the guest still holds a withdrawn channel. */
++        QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
++            if (chan->rescind_state == VMRESCIND_SENT) {
++                goto messages;
++            }
++        }
+         QTAILQ_FOREACH(chan, &vmbus->channel_list, link) {
+             if (chan->rescind_state == VMRESCIND_REOFFER) {
+                 chan->rescind_state = VMRESCIND_REOFFERING;
+@@ -2298,6 +2304,7 @@ static void vmbus_listen(VMBus *vmbus)
+         }
+     }
+ 
++messages:
+     process_message(vmbus);
+ }
+ 
+-- 
+2.47.3
+

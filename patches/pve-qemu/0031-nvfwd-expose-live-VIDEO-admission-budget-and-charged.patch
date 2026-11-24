@@ -1,0 +1,219 @@
+[PATCH 31/43] nvfwd: expose live VIDEO admission budget and charged bytes
+
+diff --git a/hw/misc/nvfwd/forward.c b/hw/misc/nvfwd/forward.c
+index 17ae253..5c06da2 100644
+--- a/hw/misc/nvfwd/forward.c
++++ b/hw/misc/nvfwd/forward.c
+@@ -449,7 +449,9 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+         account.nr = nr;
+         account.arg = arg;
+         account.size = size;
++        qemu_mutex_lock(&s->lock);
+         refused = account_before(s->objects, &account, &hold);
++        qemu_mutex_unlock(&s->lock);
+         if (refused) {
+             undo_runs(&account);
+             card_fix_answer(&s->card, nr, arg, size);
+@@ -474,8 +476,13 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+         note_map_access(s, r, arg);
+     }
+     if (account.arg) {
++        bool retained;
++
+         account.failed = rc < 0;
+-        if (!account_after(s->objects, &account, &hold)) {
++        qemu_mutex_lock(&s->lock);
++        retained = account_after(s->objects, &account, &hold);
++        qemu_mutex_unlock(&s->lock);
++        if (!retained) {
+             undo_runs(&account); /* the object that would have owned these pages does not exist */
+         }
+     }
+diff --git a/hw/misc/nvfwd/nvfwd.c b/hw/misc/nvfwd/nvfwd.c
+index e596b97..7d909cf 100644
+--- a/hw/misc/nvfwd/nvfwd.c
++++ b/hw/misc/nvfwd/nvfwd.c
+@@ -6,6 +6,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/units.h"
+ #include "qapi/error.h"
++#include "qapi/visitor.h"
+ #include "hw/core/qdev-properties.h"
+ #include <sys/mman.h>
+ #include <poll.h>
+@@ -208,6 +209,81 @@ static void nvfwd_realize(PCIDevice *pdev, Error **errp)
+                      PCI_BASE_ADDRESS_MEM_PREFETCH, &s->window);
+ }
+ 
++/*
++ * Runtime properties deliberately do not change the startup max-vram property.
++ * QMP runs under the BQL; the device's lock also orders updates with allocation
++ * admission/completion on lockless vCPU MMIO paths. Objects keeps its own lock
++ * for file-close and other object operations. The lock order is s->lock, Objects.
++ */
++static bool nvfwd_budget_ready(Object *obj, Error **errp)
++{
++    if (!DEVICE(obj)->realized) {
++        error_setg(errp, "nvfwd runtime VRAM properties require a realized device");
++        return false;
++    }
++    return true;
++}
++
++static void nvfwd_get_vram_budget(Object *obj, Visitor *v, const char *name,
++                                  void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    uint64_t bytes;
++
++    if (!nvfwd_budget_ready(obj, errp)) {
++        return;
++    }
++    qemu_mutex_lock(&s->lock);
++    bytes = objects_limit(s->objects, MEMORY_VIDEO);
++    qemu_mutex_unlock(&s->lock);
++    visit_type_uint64(v, name, &bytes, errp);
++}
++
++static void nvfwd_set_vram_budget(Object *obj, Visitor *v, const char *name,
++                                  void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    uint64_t bytes;
++
++    if (!nvfwd_budget_ready(obj, errp) ||
++        !visit_type_uint64(v, name, &bytes, errp)) {
++        return;
++    }
++    qemu_mutex_lock(&s->lock);
++    objects_set_limit(s->objects, MEMORY_VIDEO, bytes);
++    qemu_mutex_unlock(&s->lock);
++}
++
++static void nvfwd_get_vram_used(Object *obj, Visitor *v, const char *name,
++                                void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    uint64_t bytes;
++
++    if (!nvfwd_budget_ready(obj, errp)) {
++        return;
++    }
++    qemu_mutex_lock(&s->lock);
++    bytes = objects_bytes(s->objects, MEMORY_VIDEO);
++    qemu_mutex_unlock(&s->lock);
++    visit_type_uint64(v, name, &bytes, errp);
++}
++
++static void nvfwd_get_admission_reservation(Object *obj, Visitor *v, const char *name,
++                                             void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    uint64_t bytes;
++
++    if (!nvfwd_budget_ready(obj, errp)) {
++        return;
++    }
++    qemu_mutex_lock(&s->lock);
++    bytes = objects_reservation(s->objects, MEMORY_VIDEO);
++    qemu_mutex_unlock(&s->lock);
++    visit_type_uint64(v, name, &bytes, errp);
++}
++
+ static const Property nvfwd_props[] = {
+     DEFINE_PROP_STRING("allow", NvfwdState, allow_path),
+     DEFINE_PROP_STRING("sensord", NvfwdState, sensord_path),
+@@ -236,6 +312,18 @@ static void nvfwd_class_init(ObjectClass *class, const void *data)
+     k->device_id = 0x11ea;
+     k->class_id = PCI_CLASS_OTHERS;
+     device_class_set_props(dc, nvfwd_props);
++    object_class_property_add(class, "vram-budget-bytes", "uint64",
++                              nvfwd_get_vram_budget, nvfwd_set_vram_budget, NULL, NULL);
++    object_class_property_set_description(class, "vram-budget-bytes",
++        "Live VIDEO admission limit; zero blocks positive allocations; lowering does not reclaim");
++    object_class_property_add(class, "vram-used-bytes", "uint64",
++                              nvfwd_get_vram_used, NULL, NULL, NULL);
++    object_class_property_set_description(class, "vram-used-bytes",
++        "VIDEO charged bytes, including pending reservations; may exceed the live limit");
++    object_class_property_add(class, "admission-reservation-bytes", "uint64",
++                              nvfwd_get_admission_reservation, NULL, NULL, NULL);
++    object_class_property_set_description(class, "admission-reservation-bytes",
++        "Atomic max of live VIDEO limit and charged bytes; host must serialize budget changes");
+     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+ }
+ 
+diff --git a/hw/misc/nvfwd/objects.c b/hw/misc/nvfwd/objects.c
+index 5e79dc3..daee87c 100644
+--- a/hw/misc/nvfwd/objects.c
++++ b/hw/misc/nvfwd/objects.c
+@@ -48,10 +48,11 @@ Objects *objects_new(const ObjectLimits *limits, ObjectGoneFn *gone, void *opaqu
+ 
+ bool objects_claim(Objects *o, const ObjectClaim *claim)
+ {
+-    uint64_t max = o->limits.max_bytes[claim->kind];
++    uint64_t max;
+     bool ok;
+ 
+     g_mutex_lock(&o->lock);
++    max = o->limits.max_bytes[claim->kind];
+     ok = o->count < o->limits.max_objects &&
+          (claim->kind == MEMORY_NONE ||
+           (claim->bytes <= max && o->used[claim->kind] <= max - claim->bytes));
+@@ -215,3 +216,30 @@ uint64_t objects_bytes(Objects *o, MemoryKind kind)
+     g_mutex_unlock(&o->lock);
+     return bytes;
+ }
++
++uint64_t objects_limit(Objects *o, MemoryKind kind)
++{
++    uint64_t limit;
++
++    g_mutex_lock(&o->lock);
++    limit = o->limits.max_bytes[kind];
++    g_mutex_unlock(&o->lock);
++    return limit;
++}
++
++void objects_set_limit(Objects *o, MemoryKind kind, uint64_t limit)
++{
++    g_mutex_lock(&o->lock);
++    o->limits.max_bytes[kind] = limit;
++    g_mutex_unlock(&o->lock);
++}
++
++uint64_t objects_reservation(Objects *o, MemoryKind kind)
++{
++    uint64_t bytes;
++
++    g_mutex_lock(&o->lock);
++    bytes = MAX(o->limits.max_bytes[kind], o->used[kind]);
++    g_mutex_unlock(&o->lock);
++    return bytes;
++}
+diff --git a/hw/misc/nvfwd/objects.h b/hw/misc/nvfwd/objects.h
+index 0f168e3..4188a5a 100644
+--- a/hw/misc/nvfwd/objects.h
++++ b/hw/misc/nvfwd/objects.h
+@@ -53,6 +53,19 @@ void objects_file_closed(Objects *o, uint32_t file);
+ bool objects_has_client(Objects *o, uint32_t client);
+ bool objects_is_local(Objects *o, uint32_t client, uint32_t object);
+ uint32_t objects_count(Objects *o);
++/* Charged bytes include both live objects and pending claims. */
+ uint64_t objects_bytes(Objects *o, MemoryKind kind);
+ 
++/*
++ * A live admission limit, serialized with claims. Zero permits no positive charge.
++ * Lowering it does not revoke objects or pending claims; completion records the
++ * driver's actual size even if it exceeds the new limit. Subsequent claims must
++ * fit until releases or a limit increase make room. MEMORY_NONE is not limited.
++ */
++uint64_t objects_limit(Objects *o, MemoryKind kind);
++void objects_set_limit(Objects *o, MemoryKind kind, uint64_t limit);
++
++/* One snapshot for host admission: max(live limit, charged bytes). */
++uint64_t objects_reservation(Objects *o, MemoryKind kind);
++
+ #endif
+-- 
+2.47.3
+

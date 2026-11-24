@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tools/card-check"]
+# The app needs GTK's development files, which nothing else here does. Build it with `-p guesthouse-app`.
+default-members = [
+    "crates/app-core",
+    "crates/backend",
+    "crates/backend-nvidia",
+    "crates/backend-standin",
+    "crates/core",
+    "crates/daemon",
+    "crates/frame-socket",
+    "crates/jail",
+    "crates/messages",
+    "crates/replay",
+    "crates/sensors",
+    "crates/transport",
+    "tools/card-check",
+]
+
+[workspace.package]
+version = "0.4.1"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+guesthouse-transport = { path = "crates/transport" }
+guesthouse-messages = { path = "crates/messages" }
+guesthouse-backend = { path = "crates/backend" }
+guesthouse-backend-standin = { path = "crates/backend-standin" }
+guesthouse-backend-amd = { path = "crates/backend-amd" }
+guesthouse-backend-nvidia = { path = "crates/backend-nvidia" }
+guesthouse-core = { path = "crates/core" }
+guesthouse-daemon = { path = "crates/daemon" }
+guesthouse-app-core = { path = "crates/app-core" }
+guesthouse-frame-socket = { path = "crates/frame-socket" }
+guesthouse-sensors = { path = "crates/sensors" }
+guesthouse-jail = { path = "crates/jail" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+debug = "line-tables-only"
+# Numbers from a guest reach a lot of arithmetic, and a wrong sum that goes unnoticed could become a
+# wrong mapping. A stop is the better failure, and the handlers are meant to refuse such numbers first.
+overflow-checks = true

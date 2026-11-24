@@ -1,0 +1,47 @@
+[PATCH 42/43] gpupv: take a restarted backend through chardev-change
+
+diff --git a/hw/hyperv/gpupv.c b/hw/hyperv/gpupv.c
+index a78f223..adf1f65 100644
+--- a/hw/hyperv/gpupv.c
++++ b/hw/hyperv/gpupv.c
+@@ -405,6 +405,27 @@ static void gpupv_chr_event(void *opaque, QEMUChrEvent event)
+     }
+ }
+ 
++static int gpupv_chr_be_change(void *opaque);
++
++static void gpupv_set_handlers(GpupvChannel *s)
++{
++    qemu_chr_fe_set_handlers(&s->chr, gpupv_chr_can_read, gpupv_chr_read,
++                             gpupv_chr_event, gpupv_chr_be_change, s, NULL, true);
++}
++
++/*
++ * chardev-change: a restarted backend's socket replaces the dead one. Its
++ * open event offers the channel again.
++ */
++static int gpupv_chr_be_change(void *opaque)
++{
++    GpupvChannel *s = opaque;
++
++    info_report("%s: backend chardev changed", object_get_typename(OBJECT(s)));
++    gpupv_set_handlers(s);
++    return 0;
++}
++
+ static void gpupv_vmdev_realize(VMBusDevice *vdev, Error **errp)
+ {
+     GpupvChannel *s = GPUPV_CHANNEL(vdev);
+@@ -417,8 +438,7 @@ static void gpupv_vmdev_realize(VMBusDevice *vdev, Error **errp)
+     s->unanswered = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+     s->arena_fd = -1;
+     g_queue_init(&s->out);
+-    qemu_chr_fe_set_handlers(&s->chr, gpupv_chr_can_read, gpupv_chr_read,
+-                             gpupv_chr_event, NULL, s, NULL, true);
++    gpupv_set_handlers(s);
+     if (s->iomem) {
+         MemoryRegion *mr = host_memory_backend_get_memory(s->iomem);
+ 
+-- 
+2.47.3
+

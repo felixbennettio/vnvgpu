@@ -1,0 +1,437 @@
+[PATCH 36/43] nvfwd: add host-only owned TSG interleave requests
+
+diff --git a/hw/misc/nvfwd/forward.c b/hw/misc/nvfwd/forward.c
+index 78b4a8a..0874de7 100644
+--- a/hw/misc/nvfwd/forward.c
++++ b/hw/misc/nvfwd/forward.c
+@@ -93,6 +93,12 @@ static int filter_rm(NvfwdState *s, uint32_t nr, uint8_t *arg, uint32_t size)
+             return -EINVAL;
+         }
+         memcpy(&cmd, arg + 8, 4);
++        if (cmd == TSG_SET_INTERLEAVE) {
++            /* Host-only. Even an emulated-control entry must not fake success. */
++            note_once(s, "REFUSED", "host-only control", KEY(K_CTRL, cmd), cmd);
++            status_at = RM_CONTROL_STATUS;
++            break;
++        }
+         if (cmd != TSG_SET_TIMESLICE && cmd != TSG_SCHEDULE &&
+             set_has(qatomic_read(&s->allow), KEY(K_EMUCTRL, cmd))) {
+             /* Answered here with success: unknown or unwanted on the host. */
+@@ -492,6 +498,8 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+         if (retained) {
+             timeslice_created(&s->timeslice, hold.created_client, hold.created_object,
+                               host_timeslice_apply, s);
++            interleave_created(&s->timeslice, hold.created_client, hold.created_object,
++                               host_interleave_apply, s);
+         }
+         if (!retained) {
+             undo_runs(&account); /* the object that would have owned these pages does not exist */
+@@ -499,6 +507,7 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+     }
+     if (!uvm && nr == ESC_RM_CONTROL) {
+         timeslice_guest_after(&s->timeslice, arg, size, r->ret, host_timeslice_apply, s);
++        interleave_guest_after(&s->timeslice, arg, size, r->ret, host_interleave_apply, s);
+     }
+     if (s->trace) {
+         uint32_t a[10] = { 0 };
+diff --git a/hw/misc/nvfwd/host_timeslice.c b/hw/misc/nvfwd/host_timeslice.c
+index d3e1f2a..4b8ecbe 100644
+--- a/hw/misc/nvfwd/host_timeslice.c
++++ b/hw/misc/nvfwd/host_timeslice.c
+@@ -14,3 +14,15 @@ TimesliceResult host_timeslice_apply(void *opaque, const ObjectInfo *info, uint6
+     }
+     return result;
+ }
++
++/* Same owned-root pin and lifecycle contract; no privileged helper. */
++TimesliceResult host_interleave_apply(void *opaque, const ObjectInfo *info, uint32_t level)
++{
++    NvfwdState *s = opaque;
++    TimesliceResult result = { .error = EBADF };
++    if (fd_hold(s, info->root_file)) {
++        result = interleave_ioctl(host_fd(s, info->root_file), info, level);
++        fd_release_locked(s, info->root_file);
++    }
++    return result;
++}
+diff --git a/hw/misc/nvfwd/interleave.c b/hw/misc/nvfwd/interleave.c
+new file mode 100644
+index 0000000..3aed95b
+--- /dev/null
++++ b/hw/misc/nvfwd/interleave.c
+@@ -0,0 +1,167 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Host-only 615 interleave requests. No privilege escalation or fairness claim. */
++#include "interleave.h"
++#include "rm_layout.h"
++#include <errno.h>
++#include <string.h>
++#include <sys/ioctl.h>
++
++static uint32_t u32(const uint8_t *p)
++{
++    uint32_t value;
++    memcpy(&value, p, sizeof(value));
++    return value;
++}
++
++static void apply_one(Timeslice *t, const ObjectInfo *ref,
++                      InterleaveApply *apply, void *opaque)
++{
++    ObjectInfo now;
++    TimesliceResult result = { .error = ESTALE };
++    if (ref->tsg_owned &&
++        objects_get(t->objects, ref->client, ref->object, &now) &&
++        now.generation == ref->generation && now.tsg_owned) {
++        result = apply(opaque, &now, t->interleave_level);
++    }
++    objects_interleave_result(t->objects, ref, t->interleave_level,
++                              result.error, result.status);
++}
++
++void interleave_created(Timeslice *t, uint32_t client, uint32_t object,
++                        InterleaveApply *apply, void *opaque)
++{
++    ObjectInfo info;
++    if (t->interleave_configured &&
++        objects_get(t->objects, client, object, &info) &&
++        (info.hclass == TSG_CLASS || info.hclass == TSG_UNKNOWN_CLASS)) {
++        /* ALLOC alone is not readiness proof; preserve the actual failure. */
++        apply_one(t, &info, apply, opaque);
++    }
++}
++
++void interleave_guest_after(Timeslice *t, const uint8_t *arg, uint32_t size, int ret,
++                            InterleaveApply *apply, void *opaque)
++{
++    uint64_t pointer;
++    if (size != RM_CONTROL_BYTES || u32(arg + RM_CONTROL_CMD) != TSG_SCHEDULE) {
++        return; /* unrelated controls do not hold lifecycle */
++    }
++    if (!t->interleave_configured || ret < 0 ||
++        u32(arg + RM_CONTROL_STATUS) != STATUS_OK) {
++        return;
++    }
++    /* rmargs/apply_fields already validated and rewrote this pointer. */
++    memcpy(&pointer, arg + RM_CONTROL_PARAMS, sizeof(pointer));
++    if (pointer && u32(arg + RM_CONTROL_PARAMS_SIZE) == 3 &&
++        *(const uint8_t *)(uintptr_t)pointer == 1) {
++        interleave_created(t, u32(arg), u32(arg + RM_CONTROL_OBJECT), apply, opaque);
++    }
++}
++
++bool interleave_set(Timeslice *t, uint32_t level, InterleaveApply *apply,
++                    void *opaque, uint32_t *failed)
++{
++    ObjectInfo *refs;
++    uint32_t count;
++    *failed = 0;
++    if (level > 2) {
++        return false;
++    }
++    timeslice_enter(t);
++    t->interleave_configured = true; /* LOW=0 is a real request, never unset. */
++    t->interleave_level = level;
++    refs = objects_tsg_refs(t->objects, &count);
++    for (uint32_t i = 0; i < count; i++) {
++        ObjectInfo now;
++        apply_one(t, &refs[i], apply, opaque);
++        if (!objects_get(t->objects, refs[i].client, refs[i].object, &now) ||
++            now.generation != refs[i].generation || now.interleave_errno ||
++            now.interleave_status || !now.interleave_requested ||
++            now.interleave_level != level) {
++            (*failed)++;
++        }
++    }
++    g_free(refs);
++    timeslice_leave(t);
++    return true;
++}
++
++char *interleave_report(Timeslice *t)
++{
++    enum { MAX_REPORTED_REFS = 64, MAX_REPORT_BYTES = 16 * 1024 };
++    uint32_t count, reported = 0, accepted = 0, failed = 0, pending = 0;
++    ObjectInfo *refs;
++    GString *rows = g_string_new(NULL), *s;
++    char desired[16];
++    timeslice_enter(t);
++    refs = objects_tsg_refs(t->objects, &count);
++    if (t->interleave_configured) {
++        g_snprintf(desired, sizeof(desired), "%u", t->interleave_level);
++    } else {
++        g_strlcpy(desired, "unset", sizeof(desired));
++    }
++    for (uint32_t i = 0; i < count; i++) {
++        ObjectInfo *r = &refs[i];
++        if (t->interleave_configured) {
++            if (!r->tsg_owned || r->interleave_errno || r->interleave_status) {
++                failed++;
++            } else if (!r->interleave_requested || !r->interleave_attempted ||
++                       r->interleave_level != t->interleave_level) {
++                pending++;
++            } else {
++                accepted++;
++            }
++        }
++        if (reported < MAX_REPORTED_REFS) {
++            char level[16];
++            if (r->interleave_requested) {
++                g_snprintf(level, sizeof(level), "%u", r->interleave_level);
++            } else {
++                g_strlcpy(level, "unset", sizeof(level));
++            }
++            char *row = g_strdup_printf("client=%#x object=%#x generation=%" G_GUINT64_FORMAT
++                " owned=%u attempted=%u requested_level=%s errno=%d rm_status=%#x\n",
++                r->client, r->object, r->generation, r->tsg_owned,
++                r->interleave_attempted, level, r->interleave_errno, r->interleave_status);
++            if (rows->len + strlen(row) <= MAX_REPORT_BYTES - 512) {
++                g_string_append(rows, row);
++                reported++;
++            }
++            g_free(row);
++        }
++    }
++    s = g_string_new(NULL);
++    g_string_append_printf(s, "version=1 requested_level=%s"
++        " scope=requested-not-hardware-or-fixed-weight references=%u reported=%u truncated=%u"
++        " accepted=%u failed=%u pending=%u\n",
++        desired, count, reported, reported < count, accepted, failed, pending);
++    g_string_append_len(s, rows->str, rows->len);
++    g_assert(s->len <= MAX_REPORT_BYTES);
++    g_string_free(rows, TRUE);
++    g_free(refs);
++    timeslice_leave(t);
++    return g_string_free(s, FALSE);
++}
++
++TimesliceResult interleave_ioctl(int fd, const ObjectInfo *info, uint32_t level)
++{
++    /* 615 NVOS54_PARAMETERS + NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS (u32).
++     * Requires RS_ACCESS_NICE/CAP_SYS_NICE; do not hide the actual denial. */
++    struct {
++        uint32_t client, object, command, flags;
++        uint64_t params;
++        uint32_t params_size, status;
++    } control = { .client = info->client, .object = info->object,
++                  .command = TSG_SET_INTERLEAVE, .params = (uintptr_t)&level,
++                  .params_size = sizeof(level) };
++    int rc;
++    if (level > 2) {
++        return (TimesliceResult) { .error = EINVAL };
++    }
++    _Static_assert(sizeof(control) == RM_CONTROL_BYTES, "NVOS54 layout");
++    do {
++        rc = ioctl(fd, _IOWR('F', ESC_RM_CONTROL, control), &control);
++    } while (rc < 0 && errno == EINTR);
++    return (TimesliceResult) { .error = rc < 0 ? errno : 0,
++                              .status = rc < 0 ? 0 : control.status };
++}
+diff --git a/hw/misc/nvfwd/interleave.h b/hw/misc/nvfwd/interleave.h
+new file mode 100644
+index 0000000..80d14a9
+--- /dev/null
++++ b/hw/misc/nvfwd/interleave.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef NVFWD_INTERLEAVE_H
++#define NVFWD_INTERLEAVE_H
++#include "timeslice.h"
++
++#define TSG_SET_INTERLEAVE 0xa06c0107u
++typedef TimesliceResult InterleaveApply(void *opaque, const ObjectInfo *info, uint32_t level);
++/* Caller holds the existing lifecycle gate for these guest-completion hooks. */
++void interleave_created(Timeslice *t, uint32_t client, uint32_t object,
++                        InterleaveApply *apply, void *opaque);
++void interleave_guest_after(Timeslice *t, const uint8_t *arg, uint32_t size, int ret,
++                            InterleaveApply *apply, void *opaque);
++/* False for invalid level without changing policy. On true, failed counts real
++ * failures/unowned references; desired remains configured even on partial failure. */
++bool interleave_set(Timeslice *t, uint32_t level, InterleaveApply *apply,
++                    void *opaque, uint32_t *failed);
++char *interleave_report(Timeslice *t);
++TimesliceResult interleave_ioctl(int fd, const ObjectInfo *info, uint32_t level);
++#endif
+diff --git a/hw/misc/nvfwd/meson.build b/hw/misc/nvfwd/meson.build
+index d056d4b..40732be 100644
+--- a/hw/misc/nvfwd/meson.build
++++ b/hw/misc/nvfwd/meson.build
+@@ -3,6 +3,7 @@ nvfwd_ss = files(
+   'callrate.c',
+   'objects.c',
+   'timeslice.c',
++  'interleave.c',
+   'host_timeslice.c',
+   'maps.c',
+   'runs.c',
+diff --git a/hw/misc/nvfwd/nvfwd.c b/hw/misc/nvfwd/nvfwd.c
+index ec37ec0..ac29a38 100644
+--- a/hw/misc/nvfwd/nvfwd.c
++++ b/hw/misc/nvfwd/nvfwd.c
+@@ -333,6 +333,41 @@ static void nvfwd_get_timeslice_status(Object *obj, Visitor *v, const char *name
+     g_free(text);
+ }
+ 
++static void nvfwd_set_interleave(Object *obj, Visitor *v, const char *name,
++                                  void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    int64_t level;
++    uint32_t failed;
++    if (!nvfwd_budget_ready(obj, errp) ||
++        !visit_type_int64(v, name, &level, errp)) {
++        return;
++    }
++    if (s->no_gpu || level < 0 || level > 2) {
++        error_setg(errp, "interleave-level requires a GPU and LOW=0, MEDIUM=1 or HIGH=2");
++        return;
++    }
++    if (!interleave_set(&s->timeslice, level, host_interleave_apply, s, &failed)) {
++        error_setg(errp, "invalid interleave level");
++    } else if (failed) {
++        error_setg(errp, "interleave policy retained; %u TSG references failed; read interleave-status",
++                   failed);
++    }
++}
++
++static void nvfwd_get_interleave_status(Object *obj, Visitor *v, const char *name,
++                                        void *opaque, Error **errp)
++{
++    NvfwdState *s = NVFWD(obj);
++    char *text;
++    if (!nvfwd_budget_ready(obj, errp)) {
++        return;
++    }
++    text = interleave_report(&s->timeslice);
++    visit_type_str(v, name, &text, errp);
++    g_free(text);
++}
++
+ static const Property nvfwd_props[] = {
+     DEFINE_PROP_STRING("allow", NvfwdState, allow_path),
+     DEFINE_PROP_STRING("sensord", NvfwdState, sensord_path),
+@@ -381,6 +416,14 @@ static void nvfwd_class_init(ObjectClass *class, const void *data)
+                               nvfwd_get_timeslice_status, NULL, NULL, NULL);
+     object_class_property_set_description(class, "timeslice-status",
+         "Per-owned-reference generation and last actual timeslice errno/RM status");
++    object_class_property_add(class, "interleave-level", "uint32",
++                              NULL, nvfwd_set_interleave, NULL, NULL);
++    object_class_property_set_description(class, "interleave-level",
++        "Host-only requested LOW=0/MEDIUM=1/HIGH=2; read interleave-status for unset/outcomes");
++    object_class_property_add(class, "interleave-status", "str",
++                              nvfwd_get_interleave_status, NULL, NULL, NULL);
++    object_class_property_set_description(class, "interleave-status",
++        "Bounded requested interleave and per-reference RM outcomes; not hardware priority/weight");
+     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+ }
+ 
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index c5e3acf..8ed3bf5 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -22,6 +22,7 @@
+ #include "objects.h"
+ #include "sensors.h"
+ #include "timeslice.h"
++#include "interleave.h"
+ 
+ #define TYPE_NVFWD "nvfwd"
+ OBJECT_DECLARE_SIMPLE_TYPE(NvfwdState, NVFWD)
+@@ -114,6 +115,7 @@ bool fd_hold(NvfwdState *s, uint32_t id);
+ void fd_release(NvfwdState *s, uint32_t id);
+ void fd_release_locked(NvfwdState *s, uint32_t id); /* lifecycle already held */
+ TimesliceResult host_timeslice_apply(void *opaque, const ObjectInfo *info, uint64_t us);
++TimesliceResult host_interleave_apply(void *opaque, const ObjectInfo *info, uint32_t level);
+ void fd_close(NvfwdState *s, uint32_t id);
+ void do_open(NvfwdState *s, struct nvfwd_req *r);
+ 
+diff --git a/hw/misc/nvfwd/objects.c b/hw/misc/nvfwd/objects.c
+index 2c051b2..e5f59e8 100644
+--- a/hw/misc/nvfwd/objects.c
++++ b/hw/misc/nvfwd/objects.c
+@@ -131,6 +131,10 @@ void objects_add(Objects *o, const ObjectClaim *claim, uint64_t bytes, const Obj
+     e->info.timeslice_us = 0;
+     e->info.timeslice_errno = 0;
+     e->info.timeslice_status = 0;
++    e->info.interleave_requested = e->info.interleave_attempted = false;
++    e->info.interleave_level = 0;
++    e->info.interleave_errno = 0;
++    e->info.interleave_status = 0;
+     drop_claim(o, claim);
+     /* A handle used again means the driver dropped the old object without being asked here. */
+     if (find(o, info->client, info->object)) {
+@@ -313,3 +317,22 @@ bool objects_timeslice_result(Objects *o, const ObjectInfo *ref, uint64_t us,
+     g_mutex_unlock(&o->lock);
+     return same;
+ }
++
++bool objects_interleave_result(Objects *o, const ObjectInfo *ref, uint32_t level,
++                               int error, uint32_t status)
++{
++    Entry *e;
++    bool same;
++    g_mutex_lock(&o->lock);
++    e = find(o, ref->client, ref->object);
++    same = e && ref->generation && e->info.generation == ref->generation;
++    if (same) {
++        e->info.interleave_requested = true;
++        e->info.interleave_attempted = ref->tsg_owned;
++        e->info.interleave_level = level;
++        e->info.interleave_errno = error;
++        e->info.interleave_status = status;
++    }
++    g_mutex_unlock(&o->lock);
++    return same;
++}
+diff --git a/hw/misc/nvfwd/objects.h b/hw/misc/nvfwd/objects.h
+index 5e4dc7b..a23245d 100644
+--- a/hw/misc/nvfwd/objects.h
++++ b/hw/misc/nvfwd/objects.h
+@@ -35,6 +35,10 @@ typedef struct ObjectInfo {
+     uint64_t timeslice_us;
+     int timeslice_errno;
+     uint32_t timeslice_status;
++    bool interleave_requested, interleave_attempted;
++    uint32_t interleave_level;
++    int interleave_errno;
++    uint32_t interleave_status;
+     bool local;       /* answered in the device: the host has no such object */
+     void *host_range; /* guest pages mapped for the driver, unmapped when the object goes */
+     uint64_t host_bytes;
+@@ -83,4 +87,7 @@ ObjectInfo *objects_tsg_refs(Objects *o, uint32_t *count); /* g_free result */
+ bool objects_timeslice_result(Objects *o, const ObjectInfo *ref, uint64_t us,
+                               int error, uint32_t status);
+ 
++bool objects_interleave_result(Objects *o, const ObjectInfo *ref, uint32_t level,
++                               int error, uint32_t status);
++
+ #endif
+diff --git a/hw/misc/nvfwd/timeslice.c b/hw/misc/nvfwd/timeslice.c
+index fb7fa75..fe4ab26 100644
+--- a/hw/misc/nvfwd/timeslice.c
++++ b/hw/misc/nvfwd/timeslice.c
+@@ -19,6 +19,8 @@ void timeslice_init(Timeslice *t, Objects *objects)
+     g_mutex_init(&t->lifecycle);
+     t->objects = objects;
+     t->desired_us = 0;
++    t->interleave_configured = false;
++    t->interleave_level = 0;
+ }
+ 
+ void timeslice_enter(Timeslice *t) { g_mutex_lock(&t->lifecycle); }
+diff --git a/hw/misc/nvfwd/timeslice.h b/hw/misc/nvfwd/timeslice.h
+index cb9a0c6..b4e7532 100644
+--- a/hw/misc/nvfwd/timeslice.h
++++ b/hw/misc/nvfwd/timeslice.h
+@@ -15,6 +15,8 @@ typedef struct Timeslice {
+     GMutex lifecycle;
+     Objects *objects;
+     uint64_t desired_us;
++    bool interleave_configured; /* unset differs from an explicit LOW=0 */
++    uint32_t interleave_level;
+ } Timeslice;
+ 
+ typedef struct TimesliceResult { int error; uint32_t status; } TimesliceResult;
+-- 
+2.47.3
+

@@ -1,0 +1,293 @@
+0046-nvfwd-mirror-gpu-scanout-to-qemu-console.patch
+
+Index: pve-qemu-kvm-11.1.3/hw/misc/nvfwd/nvfwd.c
+===================================================================
+--- pve-qemu-kvm-11.1.3.orig/hw/misc/nvfwd/nvfwd.c
++++ pve-qemu-kvm-11.1.3/hw/misc/nvfwd/nvfwd.c
+@@ -177,6 +177,10 @@ static void nvfwd_realize(PCIDevice *pde
+     uint64_t slot_bytes = (uint64_t)NVFWD_SLOT_SIZE * NVFWD_SLOTS;
+     int i;
+ 
++    if (s->show_console && !s->show_path) {
++        error_setg(errp, "nvfwd console mirror requires show=");
++        return;
++    }
+     if (!s->allow_path || !s->log_path) {
+         error_setg(errp, "nvfwd needs allow= and log=");
+         return;
+@@ -411,6 +415,7 @@ static const Property nvfwd_props[] = {
+     DEFINE_PROP_STRING("sensord", NvfwdState, sensord_path),
+     DEFINE_PROP_STRING("log", NvfwdState, log_path),
+     DEFINE_PROP_STRING("show", NvfwdState, show_path),
++    DEFINE_PROP_BOOL("console", NvfwdState, show_console, false),
+     DEFINE_PROP_STRING("card", NvfwdState, card_text),
+     DEFINE_PROP_UINT32("card-minor", NvfwdState, card_minor, 0),
+     DEFINE_PROP_BOOL("trace", NvfwdState, trace, false),
+Index: pve-qemu-kvm-11.1.3/hw/misc/nvfwd/nvfwd.h
+===================================================================
+--- pve-qemu-kvm-11.1.3.orig/hw/misc/nvfwd/nvfwd.h
++++ pve-qemu-kvm-11.1.3/hw/misc/nvfwd/nvfwd.h
+@@ -11,6 +11,8 @@
+ 
+ #include "fbinfo.h"
+ #include "qemu/thread.h"
++#include "qemu/main-loop.h"
++#include "ui/console.h"
+ #include "hw/pci/pci_device.h"
+ #include "qom/object.h"
+ #include "system/memory.h"
+@@ -66,6 +68,14 @@ struct NvfwdState {
+     time_t allow_mtime;
+     char *show_path; /* path prefix: <path>.sock and <path>.display */
+     QemuMutex show_lock;
++    bool show_console, console_hooked, console_error_reported;
++    QemuConsole *console;
++    QEMUBH *console_bh;
++    QemuDmaBuf *console_buffers[NVFWD_SHOW_MAX_SURFACES];
++    uint64_t console_generation[NVFWD_SHOW_MAX_SURFACES];
++    uint64_t console_cached_generation[NVFWD_SHOW_MAX_SURFACES];
++    uint64_t console_sequence;
++    uint32_t console_surface_mask, console_refresh_count;
+     QemuThread show_thread;
+     int render, listener, viewer;
+     int show_fd[NVFWD_SHOW_SLOTS];
+Index: pve-qemu-kvm-11.1.3/hw/misc/nvfwd/show.c
+===================================================================
+--- pve-qemu-kvm-11.1.3.orig/hw/misc/nvfwd/show.c
++++ pve-qemu-kvm-11.1.3/hw/misc/nvfwd/show.c
+@@ -11,6 +11,9 @@
+ #include <sys/socket.h>
+ #include <sys/un.h>
+ #include "nvfwd.h"
++#if defined(CONFIG_OPENGL) && defined(CONFIG_GBM)
++#include "ui/egl-helpers.h"
++#endif
+ 
+ #define DISPLAY_LATEST 0x40 /* newest finished frame: sequence << 8 | slot */
+ #define DISPLAY_HELD 0x48 /* the slots the viewer still needs, written by the viewer */
+@@ -25,6 +28,172 @@
+ #define NVKMS_LAYOUT_PITCH 1
+ #define MODIFIER_NVIDIA_BLOCK_LINEAR 0x0300000000606010ull /* sector layout 1, generation 2, kind 6, as the guest driver offers; low bits are log2 height */
+ 
++/* The normal PVE console can mirror the GPU's actual scanout. The GPU still
++ * renders the desktop; egl-headless only reads it back for software VNC clients.
++ * This owns the frame-consumer protocol when enabled (no second native viewer).
++ */
++#if defined(CONFIG_OPENGL) && defined(CONFIG_GBM)
++static void show_console_refresh(void *opaque);
++
++static bool show_console_gfx_update(void *opaque)
++{
++    show_console_refresh(opaque);
++    return true;
++}
++
++static const GraphicHwOps show_console_ops = {
++    .gfx_update = show_console_gfx_update,
++};
++
++static void show_console_refresh(void *opaque)
++{
++    NvfwdState *s = opaque;
++    QemuDmaBuf *buffer;
++    DisplaySurface *surface;
++    egl_fb scanout = EGL_FB_INIT;
++    uint32_t slot, width = 0, height = 0, pitch = 0, fourcc = 0, offset = 0;
++    uint64_t sequence, modifier = 0, generation;
++    int fd = -1;
++    EGLContext old_context;
++    EGLDisplay old_display;
++    EGLSurface old_draw, old_read;
++
++    qemu_mutex_lock(&s->show_lock);
++    slot = s->show_newest;
++    sequence = s->show_sequence;
++    if (slot >= NVFWD_SHOW_MAX_SURFACES || sequence == s->console_sequence ||
++        (s->show_pending & (1u << slot))) {
++        qemu_mutex_unlock(&s->show_lock);
++        return;
++    }
++    if (s->console_surface_mask & (1u << slot)) {
++        fd = s->surf_fd[slot];
++        width = s->surf_w[slot];
++        height = s->surf_h[slot];
++        pitch = s->surf_pitch[slot];
++        fourcc = s->surf_format[slot];
++        modifier = s->surf_modifier[slot];
++    } else if (slot < NVFWD_SHOW_SLOTS && (s->show_ready & (1u << slot))) {
++        fd = s->show_fd[slot];
++        width = s->show_w;
++        height = s->show_h;
++        pitch = s->show_pitch;
++        fourcc = 0x34325258; /* DRM_FORMAT_XRGB8888, as the native viewer uses. */
++        modifier = 0;
++    }
++    if (fd < 0 || !width || !height || width > 8192 || height > 4320) {
++        qemu_mutex_unlock(&s->show_lock);
++        return;
++    }
++    generation = s->console_generation[slot];
++    if (!s->console_buffers[slot] ||
++        s->console_cached_generation[slot] != generation) {
++        fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
++        if (fd < 0) {
++            qemu_mutex_unlock(&s->show_lock);
++            return;
++        }
++    } else {
++        fd = -1;
++    }
++    qatomic_set(s->show_held, 1u << slot);
++    qatomic_set(s->show_reading, qatomic_read(s->show_present + slot));
++    qemu_mutex_unlock(&s->show_lock);
++
++    if (!s->console) {
++        s->console = qemu_console_lookup_by_index(0);
++    }
++    if (!s->console || !qemu_console_is_graphic(s->console) ||
++        !qemu_console_has_gl(s->console) || qemu_egl_rn_ctx == EGL_NO_CONTEXT) {
++        if (!s->console_error_reported) {
++            fprintf(s->log, "show: console mirror needs a graphical console and -display egl-headless\n");
++            fflush(s->log);
++            s->console_error_reported = true;
++        }
++        if (fd >= 0) {
++            close(fd);
++        }
++        goto release;
++    }
++    old_context = eglGetCurrentContext();
++    old_display = eglGetCurrentDisplay();
++    old_draw = eglGetCurrentSurface(EGL_DRAW);
++    old_read = eglGetCurrentSurface(EGL_READ);
++    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                        qemu_egl_rn_ctx)) {
++        if (!s->console_error_reported) {
++            fprintf(s->log, "show: cannot make the console EGL context current: %s\n",
++                    qemu_egl_get_error_string());
++            fflush(s->log);
++            s->console_error_reported = true;
++        }
++        if (fd >= 0) {
++            close(fd);
++        }
++        goto release;
++    }
++    if (fd >= 0) {
++        buffer = s->console_buffers[slot];
++        if (buffer) {
++            qemu_console_gl_release_dmabuf(s->console, buffer);
++            qemu_dmabuf_close(buffer);
++            qemu_dmabuf_free(buffer);
++        }
++        buffer = qemu_dmabuf_new(width, height, &offset, &pitch, 0, 0,
++                                  width, height, fourcc, modifier, &fd, 1,
++                                  false, false);
++        s->console_buffers[slot] = buffer;
++        s->console_cached_generation[slot] = generation;
++    }
++    buffer = s->console_buffers[slot];
++    egl_dmabuf_import_texture(buffer);
++    if (!qemu_dmabuf_get_texture(buffer)) {
++        if (!s->console_error_reported) {
++            fprintf(s->log, "show: console EGL import failed, slot %u format %#x modifier %#llx\n",
++                    slot, fourcc, (unsigned long long)modifier);
++            fflush(s->log);
++            s->console_error_reported = true;
++        }
++        goto restore;
++    }
++    if (!s->console_hooked) {
++        qemu_graphic_console_set_hwops(s->console, &show_console_ops, s);
++        s->console_hooked = true;
++        fprintf(s->log, "show: GPU scanout is now mirrored to the PVE console (%ux%u)\n",
++                width, height);
++        fflush(s->log);
++    }
++    /* Keep a CPU-facing surface attached for the VNC and QMP listeners. */
++    qemu_console_resize(s->console, width, height);
++    surface = qemu_console_surface(s->console);
++    egl_fb_setup_for_tex(&scanout, width, height,
++                         qemu_dmabuf_get_texture(buffer), false);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++        egl_fb_destroy(&scanout);
++        goto restore;
++    }
++    egl_fb_read(surface, &scanout);
++    egl_fb_destroy(&scanout);
++    qemu_console_update_full(s->console);
++    s->console_sequence = sequence;
++    s->console_error_reported = false;
++    /* 60 Hz target refresh, and a count of actual copied GPU frames. */
++    s->console_refresh_count++;
++    qatomic_set(s->show_rate,
++                (uint64_t)s->console_refresh_count << 32 | 16666666u);
++restore:
++    if (old_context != qemu_egl_rn_ctx) {
++        eglMakeCurrent(old_display == EGL_NO_DISPLAY ? qemu_egl_display : old_display,
++                        old_draw, old_read, old_context);
++    }
++release:
++    qemu_mutex_lock(&s->show_lock);
++    qatomic_set(s->show_reading, 0);
++    qatomic_set(s->show_held, 0);
++    qemu_mutex_unlock(&s->show_lock);
++}
++#endif
++
+ /* The card's render node: the one at its address, or with none given, the first NVIDIA drives. */
+ static int render_node(const char *address)
+ {
+@@ -130,6 +299,10 @@ static void *show_listen(void *opaque)
+         if (v < 0) {
+             continue;
+         }
++        if (s->show_console) {
++            close(v); /* The QEMU console owns the frame-consumer protocol. */
++            continue;
++        }
+         qemu_mutex_lock(&s->show_lock);
+         if (s->viewer >= 0) {
+             close(s->viewer);
+@@ -182,6 +355,8 @@ void do_show_buffer(NvfwdState *s, struc
+     }
+     s->show_have |= 1u << slot;
+     s->show_fd[slot] = dmabuf;
++    s->console_generation[slot]++;
++    s->console_surface_mask &= ~(1u << slot);
+     s->show_ready |= 1u << slot;
+     s->show_pending &= ~(1u << slot); /* a client that died mid-frame leaves no claim behind */
+     qatomic_set(s->show_claimed, s->show_pending);
+@@ -221,6 +396,8 @@ void do_show_surface(NvfwdState *s, stru
+     }
+     s->surf_have |= 1u << id;
+     s->surf_fd[id] = dmabuf;
++    s->console_generation[id]++;
++    s->console_surface_mask |= 1u << id;
+     s->surf_w[id] = width;
+     s->surf_h[id] = height;
+     s->surf_pitch[id] = pitch;
+@@ -276,6 +453,9 @@ void do_show_frame(NvfwdState *s, struct
+     s->show_sequence++;
+     qatomic_set(s->show_latest, s->show_sequence << 8 | slot);
+     qemu_mutex_unlock(&s->show_lock);
++    if (s->console_bh) {
++        qemu_bh_schedule(s->console_bh);
++    }
+     r->ret = 0;
+ }
+ 
+@@ -318,5 +498,13 @@ void show_init(NvfwdState *s, Error **er
+         error_setg_errno(errp, errno, "nvfwd screen socket");
+         return;
+     }
++    if (s->show_console) {
++#if defined(CONFIG_OPENGL) && defined(CONFIG_GBM)
++        s->console_bh = qemu_bh_new(show_console_refresh, s);
++#else
++        error_setg(errp, "nvfwd console mirror requires OpenGL and GBM support");
++        return;
++#endif
++    }
+     qemu_thread_create(&s->show_thread, "nvfwd-show", show_listen, s, QEMU_THREAD_DETACHED);
+ }

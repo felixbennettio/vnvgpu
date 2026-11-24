@@ -1,0 +1,23 @@
+[PATCH 30/43] hw/pci: make -vga virtio the GL device on a GL display
+
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index d319160..ff1077c 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -2137,6 +2137,13 @@ PCIDevice *pci_vga_init(PCIBus *bus)
+     case VGA_VMWARE:
+         return pci_create_simple(bus, -1, "vmware-svga");
+     case VGA_VIRTIO:
++        /*
++         * On a GL display, the GL device, in the same place on the bus as
++         * any other -vga, so the devices after it keep their addresses.
++         */
++        if (display_opengl && object_class_by_name("virtio-vga-gl")) {
++            return pci_create_simple(bus, -1, "virtio-vga-gl");
++        }
+         return pci_create_simple(bus, -1, "virtio-vga");
+     case VGA_NONE:
+     default: /* Other non-PCI types. Checking for unsupported types is already
+-- 
+2.47.3
+

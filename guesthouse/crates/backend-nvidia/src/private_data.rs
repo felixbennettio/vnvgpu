@@ -1,0 +1,640 @@
+//! The guest driver's private data for an allocation: what it asks for, and what the kernel side
+//! would fill in on real hardware.
+
+use crate::depth::{self, DepthKinds};
+use crate::profile::AllocationLayout;
+use crate::tiling::{BLOCK_LIMIT, GOB_HEIGHT, GOB_WIDTH};
+use guesthouse_backend::{AllocationShape, MemoryKind, SurfaceShape};
+
+const SMALL_PAGE: u64 = 0x1000;
+const BIG_PAGE: u64 = 0x10000;
+const DEFAULT_SIZE: u64 = 4096;
+
+/// Bits 3:2 of the second attribute word say whether the GPU's cache may hold this memory.
+const CACHE_SHIFT: u32 = 2;
+const CACHE_MASK: u32 = 3;
+const CACHE_YES: u32 = 1;
+
+/// Bit 0 of the segments byte asks for video memory.
+const SEGMENT_VIDEO: u8 = 1;
+
+// The page size and place the kernel side picks, in the RM's own attribute bits.
+const PAGE_SIZE_4K: u32 = 1 << 23;
+const PAGE_SIZE_BIG: u32 = 2 << 23;
+const PAGE_SIZE_HUGE: u32 = 3 << 23;
+const LOCATION_PCI: u32 = 1 << 25;
+const ATTRIBUTE_2_HUGE_2M: u32 = 1 << 20;
+const HUGE_PAGE: u32 = 2 << 20;
+/// Between what has been seen of 4 KiB and big pages.
+const BIG_PAGE_FROM: u32 = 0x10_0000;
+
+fn word(data: &[u8], at: usize) -> u32 {
+    data.get(at..at + 4).map_or(0, |bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+}
+
+fn set_word(data: &mut [u8], at: usize, value: u32) {
+    data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn is_ours(layout: &AllocationLayout, data: &[u8]) -> bool {
+    data.first_chunk::<4>() == Some(layout.magic)
+}
+
+/// Stops at the largest multiple there is, which is far more than can be allocated anyway.
+fn round_up(value: u64, grain: u64) -> u64 {
+    value.div_ceil(grain).saturating_mul(grain)
+}
+
+/// The size field, with two exceptions. If it's set and the two whole-block fields hold the same
+/// bigger number, that number is used. If it's empty and the request is one row whose width, pitch
+/// and total agree, the total is used.
+fn stated_size(layout: &AllocationLayout, data: &[u8]) -> u32 {
+    let (size, whole) = (word(data, layout.size), word(data, layout.whole_size));
+    let (width, total) = (word(data, layout.width), word(data, layout.total_size));
+    if size != 0 && whole > size && whole == word(data, layout.asked_size) {
+        whole
+    } else if size == 0
+        && word(data, layout.height) == 1
+        && total == width
+        && width == word(data, layout.pitch)
+    {
+        total
+    } else {
+        size
+    }
+}
+
+/// What a request asks for, before an image's shape or page rounding count: the size field, or
+/// when that is empty, the part of a block it wants. Also says whether the request is one piece of
+/// a bigger block.
+fn requested_size(layout: &AllocationLayout, data: &[u8]) -> (u64, bool) {
+    let size = stated_size(layout, data);
+    if size != 0 {
+        return (u64::from(size), false);
+    }
+    // A block of a pool has its total in one field and what this request wants in another. The
+    // driver takes the answer's size off and asks again.
+    let (whole, asked) = (word(data, layout.whole_size), word(data, layout.asked_size));
+    let (mips, limit) = (word(data, layout.mip_levels), word(data, layout.size_limit));
+    if asked != 0 && asked <= whole && mips == 0 && limit == 0 {
+        return (u64::from(asked), asked < whole);
+    }
+    match word(data, layout.fallback_size) {
+        0 => (DEFAULT_SIZE, false),
+        fallback => (u64::from(fallback), false),
+    }
+}
+
+/// The size of an allocation in video memory.
+pub fn allocation_size(layout: &AllocationLayout, data: &[u8]) -> u64 {
+    if !is_ours(layout, data) || data.len() < layout.size + 4 {
+        return DEFAULT_SIZE;
+    }
+    let (mut size, one_piece) = requested_size(layout, data);
+    let (depth, mips, layers) =
+        (word(data, layout.depth), word(data, layout.depth + 4), word(data, layout.depth + 8));
+    // The size field covers the first mip level only. The total covers them all, but buffers can
+    // hold something else there, which is never whole pages.
+    let total = u64::from(word(data, layout.total_size));
+    if depth > 1 || mips > 1 || layers > 1 || total % SMALL_PAGE == 0 {
+        size = size.max(total);
+    }
+    // The tiling fields describe a whole image, so a piece of one must not grow to it. If it does, the
+    // guest's OpenGL gives up on every render target of 64 MiB and over, which it builds from pieces
+    // of 32 MiB: the framebuffer comes back unsupported, and the program draws nothing to it.
+    if data.len() >= layout.rows + 4 && !one_piece {
+        // A tiled image fills whole blocks, whatever the size fields hold.
+        let tiling = word(data, layout.tiling);
+        let columns = u64::from(word(data, layout.columns));
+        let rows = u64::from(word(data, layout.rows));
+        if columns == 0 {
+            // On a linear image the block height field holds the whole size instead. The size field
+            // has only the first plane, so an NV12 image would lose its chroma.
+            size = size.max(u64::from(tiling));
+        } else if tiling < BLOCK_LIMIT {
+            // A block height past the engine's isn't one, so the field holds something else.
+            let blocks = columns.saturating_mul(rows);
+            size = size.max(blocks.saturating_mul(GOB_WIDTH * (GOB_HEIGHT << tiling)));
+        }
+    }
+    round_up(size, if size >= BIG_PAGE { BIG_PAGE } else { SMALL_PAGE })
+}
+
+/// The size of an allocation in the guest's own memory, with no rounding. The guest locks this
+/// much and the GPU reaches only this much, so it has to cover all the request asks for, the same
+/// as in video memory.
+pub fn exact_size(layout: &AllocationLayout, data: &[u8]) -> u64 {
+    if is_ours(layout, data) && data.len() >= layout.size + 4 {
+        requested_size(layout, data).0
+    } else {
+        DEFAULT_SIZE
+    }
+}
+
+/// A surface's shape, if the data describes one.
+pub fn surface_shape(layout: &AllocationLayout, data: &[u8]) -> Option<SurfaceShape> {
+    if !is_ours(layout, data) || data.len() < layout.rows + 4 {
+        return None;
+    }
+    let columns = word(data, layout.columns);
+    let pitch = match word(data, layout.pitch) {
+        // Some images leave the pitch empty, but a GOB is always the same width.
+        0 => columns.saturating_mul(GOB_WIDTH as u32),
+        pitch => pitch,
+    };
+    Some(SurfaceShape {
+        width: word(data, layout.width),
+        height: word(data, layout.height),
+        format: u32::from(data[layout.format]),
+        pitch,
+        tiling: (columns != 0).then(|| word(data, layout.tiling)),
+        refresh: (word(data, layout.refresh), word(data, layout.refresh + 4)),
+        samples: (word(data, layout.samples), word(data, layout.samples + 4)),
+        colour: u32::from(data[layout.colour]),
+    })
+}
+
+fn asks_gpu_cached(layout: &AllocationLayout, data: &[u8]) -> bool {
+    is_ours(layout, data)
+        && data.len() >= layout.attributes + 4
+        && word(data, layout.attributes) >> CACHE_SHIFT & CACHE_MASK == CACHE_YES
+}
+
+/// How the memory should be laid out, from the usage byte, the format byte and the attribute word the
+/// guest asked for, which starts with the depth bits.
+fn memory_kind(layout: &AllocationLayout, data: &[u8], depth: DepthKinds) -> MemoryKind {
+    if is_ours(layout, data) && data.len() >= layout.depth_bits + 4 {
+        depth::memory_kind(depth, data[layout.format], data[layout.colour], word(data, layout.depth_bits))
+    } else {
+        MemoryKind::PLAIN
+    }
+}
+
+/// Everything the core needs to know about an allocation, on a generation whose depth surfaces get
+/// kinds by `depth`.
+pub fn shape(layout: &AllocationLayout, data: &[u8], depth: DepthKinds) -> AllocationShape {
+    AllocationShape {
+        size: allocation_size(layout, data),
+        exact_size: exact_size(layout, data),
+        surface: surface_shape(layout, data),
+        gpu_cached: asks_gpu_cached(layout, data),
+        kind: memory_kind(layout, data, depth),
+    }
+}
+
+fn page_attributes(size: u32, in_video_memory: bool) -> (u32, u32) {
+    if !in_video_memory {
+        (PAGE_SIZE_4K | LOCATION_PCI, 0)
+    } else if size >= HUGE_PAGE {
+        (PAGE_SIZE_HUGE, ATTRIBUTE_2_HUGE_2M)
+    } else if size >= BIG_PAGE_FROM {
+        (PAGE_SIZE_BIG, 0)
+    } else {
+        (PAGE_SIZE_4K, 0)
+    }
+}
+
+/// Whether this is a whole request, which says how long it is and is long enough to hold the size.
+/// Anything shorter is some other kind of data, which keeps what it has.
+fn is_whole_request(layout: &AllocationLayout, data: &[u8]) -> bool {
+    data.len() >= layout.size + 4 && word(data, layout.own_length) as usize == data.len()
+}
+
+/// What the kernel side writes into a request's data. Data that says one mip level and has no size
+/// to answer, or has an answer already, stays as it is, and so does anything but a whole request.
+fn fill_in(layout: &AllocationLayout, data: &mut [u8], kind: MemoryKind) {
+    if !is_whole_request(layout, data) {
+        return;
+    }
+    let size = word(data, layout.size);
+    if data[layout.mip_levels] == 1 && (word(data, layout.whole_size) != 0 || size == 0) {
+        return;
+    }
+    let in_video = data[layout.segments] & SEGMENT_VIDEO != 0;
+    let (attributes, attributes_2) = page_attributes(size, in_video);
+    let (width, height, pitch) =
+        (word(data, layout.width), word(data, layout.height), word(data, layout.pitch));
+    let attributes = attributes | u32::from(data[layout.depth_bits]);
+    // The guest must use the same depth packing as the memory the host allocated.
+    // Compression, tiling and guest page/location flags are not part of this mask.
+    let attributes = if kind == MemoryKind::PLAIN {
+        attributes
+    } else {
+        (attributes & !depth::KIND_BITS) | (kind.0 & depth::KIND_BITS)
+    };
+    let attributes_2 = attributes_2 | word(data, layout.attributes);
+    data[layout.mip_levels] = data[layout.mip_levels].max(1);
+    data[layout.array_layers] = data[layout.array_layers].max(1);
+    set_word(data, layout.answer_width, width);
+    set_word(data, layout.answer_height, height);
+    set_word(data, layout.answer_pitch, pitch);
+    set_word(data, layout.whole_size, size);
+    set_word(data, layout.size_limit, size.wrapping_sub(1));
+    set_word(data, layout.answer_attributes, attributes);
+    set_word(data, layout.answer_attributes_2, attributes_2);
+}
+
+pub(crate) fn trace(layout: &AllocationLayout, phase: &str, data: &[u8]) {
+    if !is_ours(layout, data) || data.len() < layout.depth_bits + 4 || !crate::trace_depth() { return; }
+    if phase == "describe" && matches!(data[layout.colour], 0x41 | 0x42)
+        && (word(data, layout.size) >= 0x10_0000 || word(data, layout.whole_size) >= 0x10_0000) {
+        log::info!("P1_POOL_RAW data={data:02x?}");
+    }
+    log::info!("P1_PRIV phase={phase} len={:#x} own={:#x} usage={:#x} format={:#x} depth={:#x} attrs2={:#x} answer={:#x} answer2={:#x} size={:#x} whole={:#x} total={:#x} width={} height={} pitch={} mips={} layers={} segments={:#x} tiling={:#x} columns={} rows={}",
+        data.len(), word(data,layout.own_length),data[layout.format],data[layout.colour],word(data,layout.depth_bits),word(data,layout.attributes),word(data,layout.answer_attributes),word(data,layout.answer_attributes_2),word(data,layout.size),word(data,layout.whole_size),word(data,layout.total_size),word(data,layout.width),word(data,layout.height),word(data,layout.pitch),word(data,layout.mip_levels),word(data,layout.array_layers),data[layout.segments],word(data,layout.tiling),word(data,layout.columns),word(data,layout.rows));
+}
+
+/// Fills in the data, then puts the size this host really chose where the guest reads it.
+pub fn finish(layout: &AllocationLayout, data: &mut [u8], size: u64, kind: MemoryKind) {
+    fill_in(layout, data, kind);
+    if !is_ours(layout, data) || data.len() < layout.size_limit + 4 {
+        return;
+    }
+    set_word(data, layout.whole_size, size as u32);
+    if word(data, layout.size_limit) != 0 {
+        set_word(data, layout.size_limit, (size as u32).wrapping_sub(1));
+    }
+}
+
+/// 617 Vulkan reads this returned physical kind into its resource descriptor,
+/// then encodes it into per-view DriverProtection. It is not the attribute word.
+pub(crate) fn finish_physical_kind(layout: &AllocationLayout, data: &mut [u8], kind: u32) {
+    const ANSWER_PHYSICAL_KIND: usize = 0x1AE;
+    if is_ours(layout, data) && is_whole_request(layout, data)
+        && data.len() >= ANSWER_PHYSICAL_KIND + 4 {
+        set_word(data, ANSWER_PHYSICAL_KIND, kind);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake_guest::blank_request;
+    use crate::profile::GUEST_617;
+
+    const LAYOUT: &AllocationLayout = &GUEST_617.allocation;
+
+    fn data(size: u32) -> Vec<u8> {
+        let mut bytes = blank_request();
+        set_word(&mut bytes, LAYOUT.size, size);
+        bytes
+    }
+
+    #[test]
+    fn vulkan_physical_kind_reply_is_distinct_from_depth_attribute_bits() {
+        let mut bytes = data(0x10000);
+        for kind in [1, 3, 4, 6] {
+            set_word(&mut bytes, LAYOUT.answer_attributes, 0xac0035);
+            finish_physical_kind(LAYOUT, &mut bytes, kind);
+            assert_eq!(word(&bytes, 0x1ae), kind);
+            assert_eq!(word(&bytes, LAYOUT.answer_attributes), 0xac0035);
+        }
+        bytes[0] = 0;
+        let before = bytes.clone();
+        finish_physical_kind(LAYOUT, &mut bytes, 1);
+        assert_eq!(bytes, before);
+        let mut short = data(0x1000);
+        short.truncate(0x1ae);
+        let before = short.clone();
+        finish_physical_kind(LAYOUT, &mut short, 4);
+        assert_eq!(short, before);
+    }
+
+    #[test]
+    fn a_block_that_asks_for_all_of_itself_is_bigger_than_its_size_field() {
+        let mut bytes = data(0x20_0000);
+        set_word(&mut bytes, LAYOUT.whole_size, 0x100_0000);
+        set_word(&mut bytes, LAYOUT.asked_size, 0x100_0000);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x100_0000);
+        assert_eq!(exact_size(LAYOUT, &bytes), 0x100_0000);
+    }
+
+    #[test]
+    fn a_buffer_of_one_row_is_as_long_as_the_row() {
+        let mut bytes = data(0);
+        set_word(&mut bytes, LAYOUT.width, 0x27_D800);
+        set_word(&mut bytes, LAYOUT.height, 1);
+        set_word(&mut bytes, LAYOUT.pitch, 0x27_D800);
+        set_word(&mut bytes, LAYOUT.total_size, 0x27_D800);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x28_0000);
+    }
+
+    #[test]
+    fn a_piece_of_a_block_keeps_its_size_field() {
+        let mut bytes = data(0x20_0000);
+        set_word(&mut bytes, LAYOUT.whole_size, 0x100_0000);
+        set_word(&mut bytes, LAYOUT.asked_size, 0x8000);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x20_0000);
+    }
+
+    #[test]
+    fn a_shape_too_large_to_count_comes_out_as_a_size_nothing_can_have() {
+        let mut bytes = data(0x1000);
+        set_word(&mut bytes, LAYOUT.columns, u32::MAX);
+        set_word(&mut bytes, LAYOUT.rows, u32::MAX);
+        set_word(&mut bytes, LAYOUT.tiling, BLOCK_LIMIT - 1);
+        assert!(allocation_size(LAYOUT, &bytes) > 1 << 60);
+    }
+
+    /// A 256 x 256 surface as the guest's D3D11 driver asks for one, with this usage, format and
+    /// attribute word.
+    fn depth_surface(usage: u8, format: u8, attributes: u32) -> Vec<u8> {
+        let mut bytes = data(0x40000);
+        bytes[LAYOUT.format] = usage;
+        bytes[LAYOUT.colour] = format;
+        set_word(&mut bytes, LAYOUT.width, 256);
+        set_word(&mut bytes, LAYOUT.height, 256);
+        set_word(&mut bytes, LAYOUT.depth_bits, attributes);
+        bytes
+    }
+
+    #[test]
+    fn a_depth_surface_passes_on_its_packing() {
+        let bytes = depth_surface(0x12, 0x16, 0x3A_0002);
+        for rule in [DepthKinds::AsStated, DepthKinds::Always] {
+            assert_eq!(shape(LAYOUT, &bytes, rule).kind, MemoryKind(0x38_0002));
+        }
+    }
+
+    #[test]
+    fn a_depth_surface_with_no_usage_is_found_by_its_format_where_it_must_be() {
+        let bytes = depth_surface(0, 0x17, 0xA_0054);
+        assert_eq!(shape(LAYOUT, &bytes, DepthKinds::Always).kind, MemoryKind(0x8_0004));
+        assert_eq!(shape(LAYOUT, &bytes, DepthKinds::AsStated).kind, MemoryKind::PLAIN);
+    }
+
+    #[test]
+    fn a_colour_surface_is_plain() {
+        let bytes = depth_surface(0x11, 0x20, 0x2_2004);
+        for rule in [DepthKinds::AsStated, DepthKinds::Always] {
+            assert_eq!(shape(LAYOUT, &bytes, rule).kind, MemoryKind::PLAIN);
+            assert_eq!(shape(LAYOUT, b"something else", rule).kind, MemoryKind::PLAIN);
+        }
+    }
+
+    #[test]
+    fn other_data_gets_one_page() {
+        assert_eq!(allocation_size(LAYOUT, b"something else"), DEFAULT_SIZE);
+        assert_eq!(exact_size(LAYOUT, b"short"), DEFAULT_SIZE);
+    }
+
+    #[test]
+    fn sizes_round_to_small_then_big_pages() {
+        assert_eq!(allocation_size(LAYOUT, &data(0x1234)), 0x2000);
+        assert_eq!(allocation_size(LAYOUT, &data(0x12345)), 0x20000);
+    }
+
+    #[test]
+    fn the_exact_size_is_not_rounded() {
+        assert_eq!(exact_size(LAYOUT, &data(0x12345)), 0x12345);
+    }
+
+    /// A small buffer in the guest's memory, as its OpenGL driver asks for one: the size field is
+    /// empty, and the block and the part wanted are both 16 KiB.
+    #[test]
+    fn a_block_in_guest_memory_is_as_big_as_it_asks() {
+        let mut bytes = data(0);
+        set_word(&mut bytes, LAYOUT.whole_size, 0x4000);
+        set_word(&mut bytes, LAYOUT.asked_size, 0x4000);
+        set_word(&mut bytes, LAYOUT.fallback_size, 0x2_0000);
+        assert_eq!(exact_size(LAYOUT, &bytes), 0x4000);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x4000);
+    }
+
+    #[test]
+    fn a_piece_of_a_block_in_guest_memory_is_the_piece() {
+        let mut bytes = data(0);
+        set_word(&mut bytes, LAYOUT.whole_size, 0x10_0000);
+        set_word(&mut bytes, LAYOUT.asked_size, 0x3000);
+        assert_eq!(exact_size(LAYOUT, &bytes), 0x3000);
+    }
+
+    #[test]
+    fn an_empty_request_in_guest_memory_falls_back_like_one_in_video_memory() {
+        let mut bytes = data(0);
+        set_word(&mut bytes, LAYOUT.fallback_size, 0x2_0000);
+        assert_eq!(exact_size(LAYOUT, &bytes), 0x2_0000);
+        assert_eq!(exact_size(LAYOUT, &data(0)), DEFAULT_SIZE);
+    }
+
+    #[test]
+    fn mip_levels_use_the_total() {
+        let mut bytes = data(0x1000);
+        set_word(&mut bytes, LAYOUT.depth + 4, 3);
+        set_word(&mut bytes, LAYOUT.total_size, 0x5000);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x5000);
+    }
+
+    #[test]
+    fn a_total_that_is_not_whole_pages_is_ignored_on_a_buffer() {
+        let mut bytes = data(0x1000);
+        set_word(&mut bytes, LAYOUT.total_size, 0x0123_4567);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x1000);
+    }
+
+    #[test]
+    fn a_tiled_image_fills_whole_blocks() {
+        let mut bytes = data(0x1000);
+        set_word(&mut bytes, LAYOUT.total_size, 1);
+        set_word(&mut bytes, LAYOUT.tiling, 1);
+        set_word(&mut bytes, LAYOUT.columns, 4);
+        set_word(&mut bytes, LAYOUT.rows, 2);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 4 * 64 * 2 * 16);
+    }
+
+    /// A linear image as ffmpeg uploads one: 640 x 480 NV12, pitch 640.
+    fn linear_image(size: u32, whole: u32) -> Vec<u8> {
+        let mut bytes = data(size);
+        bytes[LAYOUT.format] = 8;
+        set_word(&mut bytes, LAYOUT.width, 640);
+        set_word(&mut bytes, LAYOUT.height, 480);
+        set_word(&mut bytes, LAYOUT.pitch, 0x280);
+        set_word(&mut bytes, LAYOUT.depth_bits, 1);
+        set_word(&mut bytes, LAYOUT.tiling, whole);
+        bytes
+    }
+
+    #[test]
+    fn a_linear_planar_image_gets_all_its_planes() {
+        assert_eq!(allocation_size(LAYOUT, &linear_image(0x4_B000, 0x7_0800)), 0x8_0000);
+    }
+
+    #[test]
+    fn a_linear_image_whose_fields_agree_keeps_its_size() {
+        let mut bytes = data(0x9_4C00);
+        set_word(&mut bytes, LAYOUT.width, 256);
+        set_word(&mut bytes, LAYOUT.height, 2380);
+        set_word(&mut bytes, LAYOUT.pitch, 0x100);
+        set_word(&mut bytes, LAYOUT.tiling, 0x9_4C00);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0xA_0000);
+    }
+
+    #[test]
+    fn a_smaller_whole_size_never_shrinks_a_linear_image() {
+        assert_eq!(allocation_size(LAYOUT, &linear_image(0x1_7000, 0)), 0x2_0000);
+        assert_eq!(allocation_size(LAYOUT, &linear_image(0x4_B000, 0x1000)), 0x5_0000);
+    }
+
+    #[test]
+    fn a_tiled_planar_image_still_counts_its_blocks() {
+        let mut bytes = linear_image(0x4_B000, 1);
+        set_word(&mut bytes, LAYOUT.columns, 10);
+        set_word(&mut bytes, LAYOUT.rows, 46);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x8_0000);
+    }
+
+    #[test]
+    fn a_piece_of_a_linear_pool_is_not_grown_to_the_whole() {
+        let mut bytes = data(0);
+        set_word(&mut bytes, LAYOUT.whole_size, 0x10_0000);
+        set_word(&mut bytes, LAYOUT.asked_size, 0x8000);
+        set_word(&mut bytes, LAYOUT.tiling, 0x10_0000);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x8000);
+    }
+
+    #[test]
+    fn a_pool_request_uses_what_it_asked_for() {
+        let mut bytes = data(0);
+        set_word(&mut bytes, LAYOUT.whole_size, 0x10_0000);
+        set_word(&mut bytes, LAYOUT.asked_size, 0x8000);
+        assert_eq!(allocation_size(LAYOUT, &bytes), 0x8000);
+    }
+
+    /// A 4096 x 4096 image of 32-bit pixels, as OpenGL asks for it: 64 MiB of tiles, in pieces.
+    fn piece_of_an_image(whole: u32, asked: u32) -> Vec<u8> {
+        let mut bytes = data(0);
+        set_word(&mut bytes, LAYOUT.whole_size, whole);
+        set_word(&mut bytes, LAYOUT.asked_size, asked);
+        set_word(&mut bytes, LAYOUT.columns, 0x100);
+        set_word(&mut bytes, LAYOUT.rows, 0x20);
+        set_word(&mut bytes, LAYOUT.tiling, 4);
+        bytes
+    }
+
+    #[test]
+    fn a_piece_of_a_tiled_image_stays_the_size_it_asked_for() {
+        assert_eq!(allocation_size(LAYOUT, &piece_of_an_image(0x400_0000, 0x200_0000)), 0x200_0000);
+    }
+
+    #[test]
+    fn a_tiled_image_in_one_piece_still_fills_its_blocks() {
+        assert_eq!(allocation_size(LAYOUT, &piece_of_an_image(0x400_0000, 0x400_0000)), 0x400_0000);
+    }
+
+    #[test]
+    fn a_surface_with_no_pitch_gets_one_from_its_columns() {
+        let mut bytes = data(0x1000);
+        set_word(&mut bytes, LAYOUT.columns, 10);
+        set_word(&mut bytes, LAYOUT.tiling, 2);
+        let surface = surface_shape(LAYOUT, &bytes).unwrap();
+        assert_eq!((surface.pitch, surface.tiling), (640, Some(2)));
+    }
+
+    #[test]
+    fn a_surface_with_no_columns_is_linear() {
+        assert_eq!(surface_shape(LAYOUT, &data(0x1000)).unwrap().tiling, None);
+    }
+
+    #[test]
+    fn the_cache_bits_are_a_yes_only_at_one() {
+        let mut bytes = data(0x1000);
+        assert!(!shape(LAYOUT, &bytes, DepthKinds::Always).gpu_cached);
+        set_word(&mut bytes, LAYOUT.attributes, 1 << CACHE_SHIFT);
+        assert!(shape(LAYOUT, &bytes, DepthKinds::Always).gpu_cached);
+        set_word(&mut bytes, LAYOUT.attributes, 2 << CACHE_SHIFT);
+        assert!(!shape(LAYOUT, &bytes, DepthKinds::Always).gpu_cached);
+    }
+
+    #[test]
+    fn a_fresh_request_is_filled_in() {
+        let mut bytes = data(0x20_0000);
+        bytes[LAYOUT.segments] = SEGMENT_VIDEO;
+        let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+        finish(LAYOUT, &mut bytes, 0x20_0000, kind);
+        assert_eq!(word(&bytes, LAYOUT.whole_size), 0x20_0000);
+        assert_eq!(word(&bytes, LAYOUT.size_limit), 0x1F_FFFF);
+        assert_eq!(word(&bytes, LAYOUT.answer_attributes), PAGE_SIZE_HUGE);
+    }
+
+    #[test]
+    fn one_mip_level_with_no_size_stays_unfilled() {
+        let mut bytes = data(0);
+        bytes[LAYOUT.mip_levels] = 1;
+        let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+        finish(LAYOUT, &mut bytes, 0x1000, kind);
+        assert_eq!(word(&bytes, LAYOUT.answer_attributes), 0);
+        assert_eq!(word(&bytes, LAYOUT.whole_size), 0x1000, "the size still goes where the guest reads it");
+    }
+
+    #[test]
+    fn a_request_that_misstates_its_length_is_not_filled_in() {
+        let mut bytes = data(0x1000);
+        let wrong = bytes.len() as u32 + 1;
+        set_word(&mut bytes, LAYOUT.own_length, wrong);
+        let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+        finish(LAYOUT, &mut bytes, 0x4000, kind);
+        assert_eq!(word(&bytes, LAYOUT.answer_attributes), 0);
+    }
+
+    #[test]
+    fn a_short_request_that_states_its_length_is_not_filled_in() {
+        let mut bytes = data(0x1000);
+        bytes.truncate(LAYOUT.size);
+        set_word(&mut bytes, LAYOUT.own_length, LAYOUT.size as u32);
+        let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+        finish(LAYOUT, &mut bytes, 0x4000, kind);
+        assert_eq!(word(&bytes, LAYOUT.answer_attributes), 0);
+    }
+
+    #[test]
+    fn data_of_another_size_only_gets_its_size() {
+        let mut bytes = data(0x1000);
+        bytes.truncate(0x100);
+        let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+        finish(LAYOUT, &mut bytes, 0x4000, kind);
+        assert_eq!(word(&bytes, LAYOUT.whole_size), 0x4000);
+        assert_eq!(word(&bytes, LAYOUT.answer_attributes), 0);
+    }
+    #[test]
+    fn a_depth_reply_keeps_the_selected_packing() {
+        for (format, requested, packed) in [
+            (0x16, 0x3A_2002, 0x38_0002),
+            (0x17, 0x0A_2004, 0x08_0004),
+            (0x38, 0x16_2004, 0x14_0004),
+            (0x39, 0x2E_2005, 0x2C_0005),
+        ] {
+            let mut bytes = depth_surface(0x12, format, requested);
+            set_word(&mut bytes, LAYOUT.size, 0x800_0000);
+            set_word(&mut bytes, LAYOUT.width, 8192);
+            set_word(&mut bytes, LAYOUT.height, 8192);
+            set_word(&mut bytes, LAYOUT.pitch, 16384);
+            set_word(&mut bytes, LAYOUT.attributes, 6);
+            bytes[LAYOUT.segments] = 3;
+            let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+            finish(LAYOUT, &mut bytes, 0x800_0000, kind);
+            assert_eq!(word(&bytes, LAYOUT.answer_attributes), PAGE_SIZE_HUGE | packed, "format {format:#x}");
+            assert_eq!(word(&bytes, LAYOUT.answer_attributes_2), ATTRIBUTE_2_HUGE_2M | 6);
+        }
+    }
+
+    #[test]
+    fn a_colour_reply_does_not_inherit_depth_or_compression_flags() {
+        let mut bytes = depth_surface(0x11, 0x07, 0x16_3004);
+        bytes[LAYOUT.segments] = SEGMENT_VIDEO;
+        let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+        finish(LAYOUT, &mut bytes, 0x40000, kind);
+        assert_eq!(word(&bytes, LAYOUT.answer_attributes), PAGE_SIZE_4K | 4);
+    }
+
+    #[test]
+    fn an_already_answered_depth_request_keeps_its_attributes() {
+        let mut bytes = depth_surface(0x12, 0x16, 0x3A_2002);
+        bytes[LAYOUT.mip_levels] = 1;
+        set_word(&mut bytes, LAYOUT.whole_size, 0x40000);
+        set_word(&mut bytes, LAYOUT.answer_attributes, 0x12345678);
+        let kind = shape(LAYOUT, &bytes, DepthKinds::Always).kind;
+        finish(LAYOUT, &mut bytes, 0x40000, kind);
+        assert_eq!(word(&bytes, LAYOUT.answer_attributes), 0x12345678);
+    }
+
+}
